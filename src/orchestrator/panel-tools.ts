@@ -21767,10 +21767,14 @@ export function buildPanelToolDefs(): PanelToolDef[] {
               // The panel answers with the created node under `added` (its id a string);
               // a bare node_id is accepted too.
               const added = isPlainObject(reply.added) ? reply.added : undefined;
-              const id = added?.id ?? reply.node_id ?? reply.id;
-              if (typeof id !== "number" && typeof id !== "string") {
+              const rawId = added?.id ?? reply.node_id ?? reply.id;
+              if (typeof rawId !== "number" && typeof rawId !== "string") {
                 throw new Error(`${label}: the canvas did not return the new node's id.`);
               }
+              // The panel spells a numeric id as a string; other panel tools
+              // (panel_create_group's node_ids, …) take the number. Hand back the
+              // canonical form so the reply feeds them directly.
+              const id = typeof rawId === "string" && /^\d+$/.test(rawId) ? Number(rawId) : rawId;
               realId.set(op.node, id);
               created.push({ provisional: op.node, node_id: id, class_type: op.class_type });
               applied.push(label);

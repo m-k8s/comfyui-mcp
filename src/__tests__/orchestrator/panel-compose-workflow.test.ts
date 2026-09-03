@@ -140,11 +140,13 @@ describe("panel_compose_workflow", () => {
     expect(adds.map((c) => c.class_type)).toEqual(["LoraLoaderModelOnly", "ModelSamplingAuraFlow"]);
 
     // Values of a created node are set on the id the canvas handed back.
+    // The panel spells the new id "101"; the tool hands the NUMBER on, the form
+    // every other panel tool (panel_create_group's node_ids, …) accepts.
     expect(of(sent, "graph_set_widget")).toContainEqual(
-      expect.objectContaining({ node_id: "101", widget: "lora_name", value: "x.safetensors" }),
+      expect.objectContaining({ node_id: 101, widget: "lora_name", value: "x.safetensors" }),
     );
     expect(of(sent, "graph_set_widget")).toContainEqual(
-      expect.objectContaining({ node_id: "101", widget: "strength_model", value: 0.8 }),
+      expect.objectContaining({ node_id: 101, widget: "strength_model", value: 0.8 }),
     );
     expect(of(sent, "graph_set_widget")).toContainEqual(
       expect.objectContaining({ node_id: 71, widget: "strength", value: 1 }),
@@ -153,15 +155,15 @@ describe("panel_compose_workflow", () => {
     // Links resolve provisional ids to the ids the canvas handed back; the last one rewires node 71.
     const links = of(sent, "graph_connect").map((c) => [c.from_node_id, c.from_output, c.to_node_id, c.to_input]);
     expect(links).toEqual([
-      [50, 0, "101", "model"],
-      ["101", 0, "102", "model"],
-      ["102", 0, 71, "model"],
+      [50, 0, 101, "model"],
+      [101, 0, 102, "model"],
+      [102, 0, 71, "model"],
     ]);
 
-    const reply = JSON.parse(textOf(res)) as { created: Array<{ node_id: string; class_type: string }> };
+    const reply = JSON.parse(textOf(res)) as { created: Array<{ node_id: number; class_type: string }> };
     expect(reply.created.map((c) => [c.node_id, c.class_type])).toEqual([
-      ["101", "LoraLoaderModelOnly"],
-      ["102", "ModelSamplingAuraFlow"],
+      [101, "LoraLoaderModelOnly"],
+      [102, "ModelSamplingAuraFlow"],
     ]);
   });
 
@@ -174,7 +176,7 @@ describe("panel_compose_workflow", () => {
     expect(res.isError, textOf(res)).toBeUndefined();
     expect(of(sent, "graph_add_node").map((c) => c.class_type)).toEqual(["CheckpointLoaderSimple", "CFGNorm"]);
     expect(of(sent, "graph_connect")).toEqual([
-      expect.objectContaining({ from_node_id: "101", from_output: 0, to_node_id: "102", to_input: "model" }),
+      expect.objectContaining({ from_node_id: 101, from_output: 0, to_node_id: 102, to_input: "model" }),
     ]);
   });
 
@@ -229,7 +231,7 @@ describe("panel_compose_workflow", () => {
     expect(res.isError, textOf(res)).toBeUndefined();
     expect(of(sent, "graph_add_node")).toHaveLength(1);
     expect(of(sent, "graph_connect")).toEqual([
-      expect.objectContaining({ from_node_id: 50, from_output: 0, to_node_id: "101", to_input: "model" }),
+      expect.objectContaining({ from_node_id: 50, from_output: 0, to_node_id: 101, to_input: "model" }),
     ]);
   });
 });
