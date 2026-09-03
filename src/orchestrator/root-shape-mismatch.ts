@@ -153,21 +153,29 @@ export function uiGraphToApiGraph(nodes: unknown): Record<string, ApiNodeLite> {
   return graph;
 }
 
-function nodesFromLiveCapture(payload: unknown): unknown[] | null {
+function nodesFromLiveCapture(payload: unknown, allowEmpty = false): unknown[] | null {
   const wf = workflowFromSerializeReply(payload);
-  if (wf && Array.isArray(wf.nodes) && wf.nodes.length > 0) return wf.nodes;
-  if (isPlainObject(payload) && Array.isArray(payload.nodes) && payload.nodes.length > 0) {
+  if (wf && Array.isArray(wf.nodes) && (allowEmpty || wf.nodes.length > 0)) return wf.nodes;
+  if (isPlainObject(payload) && Array.isArray(payload.nodes) && (allowEmpty || payload.nodes.length > 0)) {
     return payload.nodes;
   }
   return null;
 }
 
+/**
+ * The live UI graph, serialize first (structure), live capture laid over it.
+ * For content-drift recovery an EMPTY capture is a failed read (the drift was
+ * about a graph that has nodes); a caller composing onto a fresh tab passes
+ * `allowEmpty`, because zero nodes is a graph there, not a failure.
+ */
 export async function readLiveUiGraphForContentDrift(
   call: (cmd: Record<string, unknown>, timeoutMs?: number) => Promise<ToolResultLike>,
+  opts: { allowEmpty?: boolean } = {},
 ): Promise<{ nodes: unknown[]; recovered_from: "graph_serialize" | "graph_get_state" } | null> {
+  const allowEmpty = opts.allowEmpty === true;
   const serialized = await call({ cmd: "graph_serialize" }, 8000);
   if (!serialized.isError) {
-    const nodes = nodesFromLiveCapture(jsonPayload(serialized));
+    const nodes = nodesFromLiveCapture(jsonPayload(serialized), allowEmpty);
     if (nodes) {
       // A serialize names its widget values only through the `widgets_values_named`
       // mirror, which drifts. Lay the live name-keyed capture over it; the overlay
@@ -189,7 +197,7 @@ export async function readLiveUiGraphForContentDrift(
 
   const state = await call({ cmd: "graph_get_state" }, 8000);
   if (state.isError) return null;
-  const nodes = nodesFromLiveCapture(jsonPayload(state));
+  const nodes = nodesFromLiveCapture(jsonPayload(state), allowEmpty);
   if (!nodes) return null;
   return { nodes, recovered_from: "graph_get_state" };
 }

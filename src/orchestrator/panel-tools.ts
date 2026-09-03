@@ -21674,7 +21674,8 @@ export function buildPanelToolDefs(): PanelToolDef[] {
       },
       async (args: A, ctx) => {
         const code = String(args.code ?? "");
-        const live = await readLiveUiGraphForContentDrift((cmd, timeoutMs) => ctx.call(cmd, timeoutMs));
+        // A fresh tab has zero nodes: that is a graph to compose onto, not a failed read.
+        const live = await readLiveUiGraphForContentDrift((cmd, timeoutMs) => ctx.call(cmd, timeoutMs), { allowEmpty: true });
         if (!live) {
           return {
             isError: true,
@@ -21740,7 +21741,10 @@ export function buildPanelToolDefs(): PanelToolDef[] {
             const label = describe(op);
             if (op.op === "add_node") {
               const reply = await step(label, { cmd: "graph_add_node", class_type: op.class_type });
-              const id = reply.node_id;
+              // The panel answers with the created node under `added` (its id a string);
+              // a bare node_id is accepted too.
+              const added = isPlainObject(reply.added) ? reply.added : undefined;
+              const id = added?.id ?? reply.node_id ?? reply.id;
               if (typeof id !== "number" && typeof id !== "string") {
                 throw new Error(`${label}: the canvas did not return the new node's id.`);
               }

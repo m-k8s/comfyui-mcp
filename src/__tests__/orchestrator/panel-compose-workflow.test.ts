@@ -59,8 +59,11 @@ patched_model_71 = CFGNorm(model=model_b, strength=1.0)
 
 type Sent = Array<Record<string, unknown>>;
 
-function harness(opts: { failOn?: (cmd: Record<string, unknown>, nth: number) => boolean } = {}) {
+function harness(
+  opts: { failOn?: (cmd: Record<string, unknown>, nth: number) => boolean; liveNodes?: typeof LIVE_NODES } = {},
+) {
   const sent: Sent = [];
+  const LIVE = opts.liveNodes ?? LIVE_NODES;
   let nextId = 101;
   const bridge = {
     send: async (cmd: Record<string, unknown>) => {
@@ -69,14 +72,15 @@ function harness(opts: { failOn?: (cmd: Record<string, unknown>, nth: number) =>
       if (opts.failOn?.(cmd, nth)) throw new Error(`simulated failure on ${String(cmd.cmd)}`);
       switch (cmd.cmd) {
         case "graph_serialize":
-          return { workflow: { nodes: LIVE_NODES, links: [] }, node_count: LIVE_NODES.length };
+          return { workflow: { nodes: LIVE, links: [] }, node_count: LIVE.length };
         case "graph_get_state":
           return {
             viewing: { scope: "root" },
-            nodes: LIVE_NODES.map((n) => ({ id: n.id, type: n.type, widgets: {} })),
+            nodes: LIVE.map((n) => ({ id: n.id, type: n.type, widgets: {} })),
           };
         case "graph_add_node":
-          return { ok: true, node_id: nextId++, type: cmd.class_type };
+          // The real panel reply: the created node under `added`, its id a STRING.
+          return { added: { id: String(nextId++), type: cmd.class_type, mode: "active" }, viewing: { scope: "root" } };
         case "graph_set_widget":
           return { ok: true, node_id: cmd.node_id, widget: cmd.widget, previous: null, value: cmd.value };
         case "graph_connect":
@@ -121,27 +125,40 @@ describe("panel_compose_workflow", () => {
 
     // Values of a created node are set on the id the canvas handed back.
     expect(of(sent, "graph_set_widget")).toContainEqual(
-      expect.objectContaining({ node_id: 101, widget: "lora_name", value: "x.safetensors" }),
+      expect.objectContaining({ node_id: "101", widget: "lora_name", value: "x.safetensors" }),
     );
     expect(of(sent, "graph_set_widget")).toContainEqual(
-      expect.objectContaining({ node_id: 101, widget: "strength_model", value: 0.8 }),
+      expect.objectContaining({ node_id: "101", widget: "strength_model", value: 0.8 }),
     );
     expect(of(sent, "graph_set_widget")).toContainEqual(
       expect.objectContaining({ node_id: 71, widget: "strength", value: 1 }),
     );
 
-    // Links resolve provisional ids to real ones; the last one rewires node 71.
+    // Links resolve provisional ids to the ids the canvas handed back; the last one rewires node 71.
     const links = of(sent, "graph_connect").map((c) => [c.from_node_id, c.from_output, c.to_node_id, c.to_input]);
     expect(links).toEqual([
-      [50, 0, 101, "model"],
-      [101, 0, 102, "model"],
-      [102, 0, 71, "model"],
+      [50, 0, "101", "model"],
+      ["101", 0, "102", "model"],
+      ["102", 0, 71, "model"],
     ]);
 
-    const reply = JSON.parse(textOf(res)) as { created: Array<{ node_id: number; class_type: string }> };
+    const reply = JSON.parse(textOf(res)) as { created: Array<{ node_id: string; class_type: string }> };
     expect(reply.created.map((c) => [c.node_id, c.class_type])).toEqual([
-      [101, "LoraLoaderModelOnly"],
-      [102, "ModelSamplingAuraFlow"],
+      ["101", "LoraLoaderModelOnly"],
+      ["102", "ModelSamplingAuraFlow"],
+    ]);
+  });
+
+  it("composes onto a BLANK canvas (a fresh tab has zero nodes, which is a graph, not a failed read)", async () => {
+    const { sent, ctx } = harness({ liveNodes: [] });
+    const res = await tool().handler(
+      { code: `model_1, clip_1, vae_1 = CheckpointLoaderSimple(ckpt_name="a.safetensors")\nx = CFGNorm(model=model_1)` },
+      ctx,
+    );
+    expect(res.isError, textOf(res)).toBeUndefined();
+    expect(of(sent, "graph_add_node").map((c) => c.class_type)).toEqual(["CheckpointLoaderSimple", "CFGNorm"]);
+    expect(of(sent, "graph_connect")).toEqual([
+      expect.objectContaining({ from_node_id: "101", from_output: 0, to_node_id: "102", to_input: "model" }),
     ]);
   });
 
@@ -184,7 +201,7 @@ describe("panel_compose_workflow", () => {
     expect(res.isError, textOf(res)).toBeUndefined();
     expect(of(sent, "graph_add_node")).toHaveLength(1);
     expect(of(sent, "graph_connect")).toEqual([
-      expect.objectContaining({ from_node_id: 50, from_output: 0, to_node_id: 101, to_input: "model" }),
+      expect.objectContaining({ from_node_id: 50, from_output: 0, to_node_id: "101", to_input: "model" }),
     ]);
   });
 });
