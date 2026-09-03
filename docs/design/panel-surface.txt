@@ -69,6 +69,7 @@ panel_save_workflow
 panel_screenshot
 panel_search_nodes
 panel_select_nodes
+panel_set_group_mode
 panel_set_node_collapsed
 panel_set_node_color
 panel_set_node_mode

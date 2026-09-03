@@ -26450,6 +26450,89 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
         ctx.call({ cmd: "graph_set_node_mode", node_id: args.node_id, mode: args.mode, force: args.force }),
     ),
     def(
+      "panel_set_group_mode",
+      "Set the EXECUTION MODE of EVERY node inside a GROUP box on the user's open graph — active, bypass, or mute — in one call, the way a user toggles a whole stage. Identify the group by numeric id via `group_id`, or by case-insensitive title substring via `group`. " +
+        "Membership is what the canvas reports for the box (panel_graph_outline's GROUPS index); each node is switched through the same rule as panel_set_node_mode, one undo step per node. A group whose member list is capped is refused rather than half-switched. " +
+        "Returns { group_id, title, mode, nodes: [{ node_id, mode, previous_mode }] }.",
+      {
+        ...GROUP_ID_ARGS,
+        mode: z
+          .enum(["active", "bypass", "mute"])
+          .describe(
+            "'active' = runs normally; 'bypass' = skipped, passes input through (downstream still runs); 'mute' = node and everything downstream do not execute.",
+          ),
+        force: z
+          .boolean()
+          .optional()
+          .describe("Passed to every node as panel_set_node_mode's `force` (override the unsafe-bypass guard on subgraph nodes)."),
+      },
+      async (args: A, ctx) => {
+        const ref = resolveGroupRefArg("panel_set_group_mode", args);
+        if (!ref.ok) return fail(ref.error);
+        const target = await resolveGroupMutationTarget(ref.value, ctx);
+        if (!target.ok) return target.result;
+
+        const query = await ctx.call({ cmd: "graph_query", fields: "ids", limit: 1 }, 8000);
+        if (query.isError) return query;
+        const payload = parseToolResultJson(query);
+        const groups = Array.isArray(payload?.groups) ? payload.groups : [];
+        const group = groups.find(
+          (g): g is Record<string, unknown> => !!g && typeof g === "object" && !Array.isArray(g) && (g as Record<string, unknown>).id === target.value,
+        );
+        if (!group) {
+          return fail(
+            `Group ${String(target.value)} is not in the live groups index. Re-read with panel_graph_outline and retry with the id it shows.`,
+          );
+        }
+        const title = typeof group.title === "string" ? group.title : undefined;
+        if (group.node_ids_truncated) {
+          return fail(
+            `The member list of group ${String(target.value)}${title ? ` "${title}"` : ""} is capped (${String(group.node_ids_truncated)}), so switching from it would leave part of the group untouched. Refused. Switch the nodes with panel_set_node_mode, or split the group.`,
+          );
+        }
+        const members = (Array.isArray(group.node_ids) ? group.node_ids : []).filter(
+          (n): n is number | string => typeof n === "number" || typeof n === "string",
+        );
+        const mode = String(args.mode);
+        if (members.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ group_id: target.value, title, mode, nodes: [], note: "The group holds no node; nothing to do." }, null, 2),
+              },
+            ],
+          };
+        }
+
+        const nodes: Array<{ node_id: number | string; mode: string; previous_mode?: string }> = [];
+        for (const nodeId of members) {
+          let res: ToolResult;
+          try {
+            res = await ctx.call({ cmd: "graph_set_node_mode", node_id: nodeId, mode: args.mode, force: args.force });
+          } catch (err) {
+            res = fail(err instanceof Error ? err.message : String(err));
+          }
+          if (res.isError) {
+            return fail(
+              `Stopped at node ${String(nodeId)}: ${toolResultText(res)}\n` +
+                `Already switched to ${mode}: ${nodes.map((n) => String(n.node_id)).join(", ") || "none"} (each undoable with Ctrl+Z). ` +
+                `Not switched: ${members.slice(nodes.length).map(String).join(", ")}.`,
+            );
+          }
+          const reply = parseToolResultJson(res);
+          nodes.push({
+            node_id: nodeId,
+            mode: typeof reply?.mode === "string" ? reply.mode : mode,
+            ...(typeof reply?.previous_mode === "string" ? { previous_mode: reply.previous_mode } : {}),
+          });
+        }
+        return {
+          content: [{ type: "text", text: JSON.stringify({ group_id: target.value, title, mode, nodes }, null, 2) }],
+        };
+      },
+    ),
+    def(
       "panel_set_node_color",
       "Legacy color compatibility wrapper. Unlike panel_edit_node, color and bgcolor accept any CSS color string; when preset is supplied it wins over explicit colors, preserving the historical bridge behavior.",
       {
