@@ -189,7 +189,9 @@ describe("recoverContentOnlyGraphQuery (#2544)", () => {
     expect(recovered?.note).toBe(CONTENT_ONLY_QUERY_NOTE);
     expect(String(recovered?.text)).toContain("MiniMaxH3Director");
     expect(String(recovered?.text)).toContain(PROMPT);
-    expect(sent).toEqual(["graph_serialize"]);
+    // The live widget capture is laid over the serialize (its `widgets_values_named`
+    // is a drifting mirror); a capture that fails leaves the serialized read intact.
+    expect(sent).toEqual(["graph_serialize", "graph_get_state"]);
     expect(sent).not.toContain("workflow_open");
     expect(sent).not.toContain("workflow_load");
   });

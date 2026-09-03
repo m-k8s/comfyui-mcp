@@ -11,6 +11,7 @@
 // fail-closed.
 
 import { queryApiGraph, type GraphQueryOptions } from "../services/graph-query.js";
+import { applyCapturedWidgetValues } from "../services/live-widget-overlay.js";
 import { isPlainObject, workflowFromSerializeReply } from "./open-identity-normalization.js";
 
 export const CONTENT_ONLY_QUERY_NOTE =
@@ -96,16 +97,37 @@ function nodeTitle(node: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
-function nodeWidgets(node: Record<string, unknown>): Record<string, unknown> {
-  if (isPlainObject(node.widgets_values_named)) return node.widgets_values_named;
-  if (isPlainObject(node.widgets)) return node.widgets;
-  return {};
+type NamedWidgets = {
+  widgets: Record<string, unknown>;
+  /** Set when the ONLY name-keyed source was the serialized mirror. */
+  source?: "widgets_values_named";
+};
+
+/**
+ * Name-keyed widget values, most trustworthy source first.
+ *
+ * `widgets_values_named` is a MIRROR: the frontend writes it once and then
+ * carries it along, nothing re-synchronises it when a widget changes. On two
+ * real workflows it announced one LoRA while `widgets_values` (what ComfyUI
+ * executes) loaded another. So the live capture wins — `capturedWidgetValues`
+ * laid over a serialize by live-widget-overlay, or the `widgets` map a
+ * `graph_get_state` summary reads straight off the litegraph widget objects —
+ * and the mirror is a last resort that the caller is told about.
+ */
+function nodeWidgets(node: Record<string, unknown>): NamedWidgets {
+  if (isPlainObject(node.capturedWidgetValues)) return { widgets: node.capturedWidgetValues };
+  if (isPlainObject(node.widgets)) return { widgets: node.widgets };
+  if (isPlainObject(node.widgets_values)) return { widgets: node.widgets_values };
+  if (isPlainObject(node.widgets_values_named)) {
+    return { widgets: node.widgets_values_named, source: "widgets_values_named" };
+  }
+  return { widgets: {} };
 }
 
 type ApiNodeLite = {
   class_type: string;
   inputs: Record<string, unknown>;
-  _meta?: { title: string };
+  _meta?: { title?: string; widgets_source?: "widgets_values_named" };
 };
 
 /** Named widgets from a UI serialize / graph_get_state node list, for queryApiGraph. */
@@ -117,10 +139,15 @@ export function uiGraphToApiGraph(nodes: unknown): Record<string, ApiNodeLite> {
     if (raw.id == null) continue;
     const id = String(raw.id);
     const title = nodeTitle(raw);
+    const named = nodeWidgets(raw);
+    const meta: NonNullable<ApiNodeLite["_meta"]> = {
+      ...(title ? { title } : {}),
+      ...(named.source ? { widgets_source: named.source } : {}),
+    };
     graph[id] = {
       class_type: typeof raw.type === "string" ? raw.type : "",
-      inputs: nodeWidgets(raw),
-      ...(title ? { _meta: { title } } : {}),
+      inputs: named.widgets,
+      ...(Object.keys(meta).length ? { _meta: meta } : {}),
     };
   }
   return graph;
@@ -141,7 +168,21 @@ export async function readLiveUiGraphForContentDrift(
   const serialized = await call({ cmd: "graph_serialize" }, 8000);
   if (!serialized.isError) {
     const nodes = nodesFromLiveCapture(jsonPayload(serialized));
-    if (nodes) return { nodes, recovered_from: "graph_serialize" };
+    if (nodes) {
+      // A serialize names its widget values only through the `widgets_values_named`
+      // mirror, which drifts. Lay the live name-keyed capture over it; the overlay
+      // refuses on its own when the capture describes another graph (a subgraph
+      // the user is inside), and the nodes then keep what the serialize said.
+      // The capture is a betterment of a read that already succeeded: a refused or
+      // failed capture keeps the serialized values, it never fails the read.
+      try {
+        const state = await call({ cmd: "graph_get_state" }, 8000);
+        if (!state.isError) applyCapturedWidgetValues({ nodes }, jsonPayload(state));
+      } catch {
+        // unknown-ok: the serialized values stand, mirror caveat included
+      }
+      return { nodes, recovered_from: "graph_serialize" };
+    }
   } else if (isRootShapeMismatch(resultText(serialized)) && !isContentOnlyRootShapeMismatch(resultText(serialized))) {
     return null;
   }
