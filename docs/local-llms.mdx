@@ -435,8 +435,12 @@ Any MCP client gets the **full tool surface** — generation, workflow
 authoring, models, custom nodes, queue, diagnostics — in either tool mode.
 The Claude Code **plugin extras** (skills, slash commands, hooks, installer
 packs, the sidebar panel agent) are plugin features and don't travel to other
-harnesses. The `list_tools` catalog is designed to carry enough orientation
-that agents without that knowledge layer can still find their way.
+harnesses as such. The CONTENT of the skills does travel, though: every
+client can read them through `list_packs` (`action:"skill_list"` to see the
+names, `action:"skill_read"` for a skill's full body), and the built-in prompt of
+the Ollama / custom-endpoint lane tells the model to do so before building a
+graph for a model family. The `list_tools` catalog is designed to carry enough
+orientation that agents without that knowledge layer can still find their way.
 
 ## Troubleshooting
 

@@ -4,6 +4,7 @@ import {
   comfyuiSpawnEnv,
   comfyuiSpawnToolMode,
   acceptsModelId,
+  blockedRepeatResult,
   isOllamaModel,
   ollamaSystemPrompt,
   ollamaZeroToolCause,
@@ -1374,6 +1375,25 @@ describe("the system prompt describes the surface that was actually advertised (
       expect(ollamaSystemPrompt(mode)).toContain("never invent results");
       expect(ollamaSystemPrompt(mode)).toContain("PAID credits");
     }
+  });
+
+  // Knowledge parity: the frontier lanes load the bundled skills natively and
+  // PANEL_SYSTEM_APPEND tells them to read one before building a family graph.
+  // This adapter drops that preamble on purpose, and the skills are STILL
+  // reachable here — republished as list_packs action:"skill_list"/"skill_read" —
+  // but nothing told the model so. A small model then builds a generic graph
+  // from memory while the family's recipe sits one tool call away.
+  it("both modes point at the bundled skills through list_packs before hand-building a family graph", () => {
+    for (const mode of ["compact", "full"] as const) {
+      const p = ollamaSystemPrompt(mode);
+      expect(p).toContain('"skill_list"');
+      expect(p).toContain('"skill_read"');
+      expect(p).toMatch(/before (you )?build/i);
+    }
+  });
+
+  it("the repeat-call and search-limit nudges name the skills next to the packs", () => {
+    expect(blockedRepeatResult("list_tools", undefined).text).toContain("skill_list");
   });
 });
 

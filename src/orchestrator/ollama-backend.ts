@@ -410,6 +410,15 @@ const OLLAMA_PROMPT_RULES = [
   "- To EDIT the graph — add a node (e.g. a LoraLoader after a download), wire slots, set widgets, run — those are PANEL tools too: panel_call_tool with panel_add_node / panel_connect / panel_set_widget / panel_run. Do NOT search the headless list_tools catalog for graph editing; it is not there.",
   "- To see or show any generated image/video, run the panel_show_media tool via panel_call_tool.",
   "- Workflows with API nodes cost the user PAID credits; local-GPU workflows are free. Ask before anything that might spend credits.",
+  // Knowledge parity with the frontier lanes, which load the bundled skills
+  // natively and are told by PANEL_SYSTEM_APPEND to read one before building a
+  // family graph. This adapter drops that preamble on purpose (see above), and
+  // the skills are republished as list_packs actions precisely so this lane can
+  // reach them — but until this line nothing told the model they existed, and a
+  // small model then builds a generic graph from memory with the family's recipe
+  // one tool call away. Two lines, valid in compact and full alike.
+  '- Model FAMILIES (krea2, qwen-image-edit, wan, ltx, z-image, flux, …) ship a bundled SKILL with the right models, settings and wiring: call_tool {"name":"list_packs","args":{"action":"skill_list"}} to see them, then {"name":"list_packs","args":{"action":"skill_read","name":"<skill>"}} and follow it BEFORE you build a workflow for that family.',
+  "- Do not guess a family's parameters from memory when a skill or an installer pack covers it.",
 ];
 
 /** The built-in prompt for a given tool mode. `full` is reached only via #788's
@@ -567,7 +576,7 @@ export function blockedRepeatResult(
     text:
       `REPEAT CALL BLOCKED: you already called ${name} with these exact arguments this turn — the result has not changed. ` +
       `Do not call it again. Use the earlier result, or try DIFFERENT arguments or a different tool. ` +
-      `Model families like krea2 / qwen-image-edit / wan / ltxv are installer PACKS, not tools: call_tool {"name":"list_packs"} to find them, then load one. ` +
+      `Model families like krea2 / qwen-image-edit / wan / ltxv are installer PACKS, not tools: call_tool {"name":"list_packs"} to find them, then load one; their bundled SKILLS are list_packs action:"skill_list" then action:"skill_read". ` +
       `If you are stuck, tell the user what you found and ask how to proceed.`,
     isError: true,
   };
@@ -2150,7 +2159,7 @@ export class OllamaBackend implements AgentBackend {
                       `SEARCH LIMIT: you have called ${discoveryKey} ${discoveryHits} times without finding a matching tool — it is very likely NOT in this catalog. STOP searching. ` +
                       `Common misses: GRAPH/CANVAS actions (add a node, connect slots, set a widget, run the workflow) are PANEL tools — panel_call_tool {"name":"panel_add_node"} / panel_connect / panel_set_widget / panel_run, listed by panel_list_tools, NOT here. ` +
                       `Civitai keyword search is download_model action:"search_civitai" (filter by types + base_models, then action:"download_civitai"); ` +
-                      `model families like krea2 / qwen-image-edit / wan / ltxv are installer PACKS — call_tool {"name":"list_packs"}. ` +
+                      `model families like krea2 / qwen-image-edit / wan / ltxv are installer PACKS — call_tool {"name":"list_packs"} — and their bundled SKILLS are list_packs action:"skill_list" / "skill_read". ` +
                       `Otherwise, tell the user plainly what IS available and ask how they want to proceed. Do not call ${discoveryKey} again.`,
                     isError: true,
                   }
