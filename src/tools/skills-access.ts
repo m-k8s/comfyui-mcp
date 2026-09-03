@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { appendFileSync, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { parse as parseYaml } from "yaml";
@@ -97,6 +97,52 @@ function skillsDir(): string {
   return join(packageRoot(), "plugin", "skills");
 }
 
+/**
+ * Extra skill directories from COMFYUI_MCP_SKILLS_DIRS (path-delimited, like
+ * PATH). The lanes that cannot load skills natively — Ollama, the custom
+ * OpenAI-compatible endpoint, OpenRouter — reach skills ONLY through
+ * action:"skill_list" / "skill_read", so a user's own skills (which the Claude
+ * lane picks up from ~/.claude/skills by itself) were out of their reach.
+ * Missing directories are skipped silently: the variable is a wish list.
+ */
+function extraSkillsDirs(): string[] {
+  const raw = process.env.COMFYUI_MCP_SKILLS_DIRS;
+  if (!raw) return [];
+  const out: string[] = [];
+  for (const entry of raw.split(delimiter)) {
+    const dir = entry.trim();
+    if (!dir || out.includes(dir)) continue;
+    try {
+      if (statSync(dir).isDirectory()) out.push(dir);
+    } catch {
+      // unknown-ok: a directory that is not there yet
+    }
+  }
+  return out;
+}
+
+/** Where skills are looked up, bundled first: a name clash is settled in favour
+ *  of the bundled skill, the one the prompts refer to. */
+function skillsDirs(): Array<{ root: string; source: string }> {
+  return [{ root: skillsDir(), source: "bundled" }, ...extraSkillsDirs().map((root) => ({ root, source: root }))];
+}
+
+/** The directory of skill `name`, in lookup order; null when no root has it. */
+function locateSkillDir(name: string): { dir: string; source: string } | null {
+  if (!SAFE_NAME.test(name)) return null;
+  for (const { root, source } of skillsDirs()) {
+    const dir = join(root, name);
+    // Defense in depth alongside the regex: the resolved path must stay under the root.
+    if (!dir.startsWith(root)) continue;
+    try {
+      if (statSync(dir).isDirectory() && existsSync(join(dir, "SKILL.md"))) return { dir, source };
+    } catch {
+      // unknown-ok: not in this root
+    }
+  }
+  return null;
+}
+
 function packsDir(): string {
   return join(packageRoot(), "packs");
 }
@@ -124,39 +170,43 @@ function splitFrontmatter(text: string): { frontmatter: Record<string, unknown>;
   return { frontmatter: fm, body: norm.slice(m[0].length) };
 }
 
-/** Read a skill's SKILL.md, returning null when the dir/file is missing. */
+/** Read a skill's SKILL.md from the first root that has it; null when none does. */
 function readSkillFile(name: string): string | null {
-  const file = join(skillsDir(), name, "SKILL.md");
-  if (!existsSync(file)) return null;
+  const located = locateSkillDir(name);
+  if (!located) return null;
   try {
-    return readFileSync(file, "utf8");
+    return readFileSync(join(located.dir, "SKILL.md"), "utf8");
   } catch {
     return null;
   }
 }
 
-/** Enumerate bundled skills as { name, description }. Tolerant of a missing
- *  plugin dir (returns []) and of skills with no/garbled frontmatter. */
-function enumerateSkills(): Array<{ name: string; description: string }> {
-  const dir = skillsDir();
-  if (!existsSync(dir)) return [];
-  const out: Array<{ name: string; description: string }> = [];
-  for (const entry of readdirSync(dir)) {
-    if (!SAFE_NAME.test(entry)) continue;
-    let isDir = false;
-    try {
-      isDir = statSync(join(dir, entry)).isDirectory();
-    } catch {
-      continue;
+/** Enumerate the skills of every root as { name, description, source }, bundled
+ *  first, a name listed once (its first root wins). Tolerant of a missing dir
+ *  (skipped) and of skills with no/garbled frontmatter. */
+function enumerateSkills(): Array<{ name: string; description: string; source: string }> {
+  const out: Array<{ name: string; description: string; source: string }> = [];
+  const seen = new Set<string>();
+  for (const { root, source } of skillsDirs()) {
+    if (!existsSync(root)) continue;
+    for (const entry of readdirSync(root)) {
+      if (!SAFE_NAME.test(entry) || seen.has(entry)) continue;
+      let text: string | null = null;
+      try {
+        if (!statSync(join(root, entry)).isDirectory()) continue;
+        text = readFileSync(join(root, entry, "SKILL.md"), "utf8");
+      } catch {
+        continue; // no SKILL.md → not a skill
+      }
+      const { frontmatter } = splitFrontmatter(text);
+      const name = typeof frontmatter.name === "string" ? frontmatter.name : entry;
+      if (seen.has(name)) continue;
+      seen.add(entry);
+      seen.add(name);
+      const description =
+        typeof frontmatter.description === "string" ? frontmatter.description : "";
+      out.push({ name, description, source });
     }
-    if (!isDir) continue;
-    const text = readSkillFile(entry);
-    if (text == null) continue; // no SKILL.md → not a skill
-    const { frontmatter } = splitFrontmatter(text);
-    const name = typeof frontmatter.name === "string" ? frontmatter.name : entry;
-    const description =
-      typeof frontmatter.description === "string" ? frontmatter.description : "";
-    out.push({ name, description });
   }
   out.sort((a, b) => a.name.localeCompare(b.name));
   return out;
@@ -423,7 +473,7 @@ export function registerSkillsAccessTools(server: McpServer): void {
       '- action:"check_runtime" — Determine whether a workflow runs on the user\'s OWN GPU (LOCAL — free) or uses hosted API NODES (PAID api credits). Pass `pack` (a bundled pack name — always local/free) OR `graph` (a UI or API/prompt workflow JSON, as object or string). It scans the workflow\'s node class_types against the connected ComfyUI\'s API-node set (the same signal list_api_nodes uses) and returns { runtime: \'local\'|\'api\'|\'mixed\'|\'unknown\', usesApiNodes, apiNodes[], externalApiNodes[], unknownNodes[] } — \'unknown\' means some nodes couldn\'t be classified (could be paid), so treat it (and \'api\'/\'mixed\') as POSSIBLY PAID; only \'local\' is confirmed free. `externalApiNodes` is the THIRD-PARTY paid kind (a fal.ai-style pack, or any node taking a service credential): those are INSTALLED LOCALLY yet still cost money, billed by that provider on the user\'s own account with them rather than out of Comfy api credits — so when you ask the user, name the provider, not "Comfy credits" (`externalProviders` names it when recognised — e.g. ["fal.ai"]; it is absent when the node was flagged only by taking a service credential, which proves it authenticates somewhere but not to whom). ALWAYS call this before building OR loading a non-pack/ad-hoc workflow so you can ASK the user before spending paid API credits — never silently use API nodes.\n' +
       '- action:"extract_deps" — Analyze a ComfyUI workflow (`workflow`, API JSON) and determine which custom node packs it requires. Maps each node class_type to its owning node pack using ComfyUI-Manager mappings and the server\'s installed node definitions, reporting which packs are installed vs missing. READ-ONLY — it installs nothing. Works remotely (HTTP only) — mirrors `comfy-cli node deps-in-workflow`.\n' +
       '- action:"install_deps" — MUTATING: this is the ONE action on this tool that INSTALLS anything. Resolve and INSTALL the custom node packs a ComfyUI workflow (`workflow`) requires, via ComfyUI-Manager: it determines the missing packs, resets the Manager queue, QUEUES THE INSTALLS, starts the worker, and reports what was installed/already-present/unresolved. Installing a pack downloads and runs third-party code (and may pull large files) on the connected ComfyUI host — local OR remote --comfyui-url — and a ComfyUI restart is typically needed before new nodes load. Use action:"extract_deps" first if you only want to SEE what is missing. Mirrors `comfy-cli node install-deps`.\n' +
-      '- action:"skill_list" — List the bundled ComfyUI model-family + workflow skills shipped with comfyui-mcp (name + description for each). These encode per-family expertise (e.g. krea2-txt2img: native krea2 CLIPLoader, Qwen3-VL encoder, 8-step turbo settings) and the installer-packs system. Call this BEFORE hand-building a <model-family> workflow from scratch — if a matching skill exists, read its full guidance with action:"skill_read" and prefer a ready installer pack (action:"list") over a generic graph. Claude loads these natively; this action gives the SAME knowledge to any MCP client (e.g. the Codex backend).\n' +
+      '- action:"skill_list" — List the bundled ComfyUI model-family + workflow skills shipped with comfyui-mcp, plus the user\'s own skills from COMFYUI_MCP_SKILLS_DIRS (name + description + source for each). These encode per-family expertise (e.g. krea2-txt2img: native krea2 CLIPLoader, Qwen3-VL encoder, 8-step turbo settings) and the installer-packs system. Call this BEFORE hand-building a <model-family> workflow from scratch — if a matching skill exists, read its full guidance with action:"skill_read" and prefer a ready installer pack (action:"list") over a generic graph. Claude loads these natively; this action gives the SAME knowledge to any MCP client (e.g. the Codex backend).\n' +
       '- action:"skill_read" — Return the full body of a bundled skill\'s SKILL.md by name (`name`; discover names with action:"skill_list"). Gives you the family\'s complete expertise on demand — model slots, node graph, recommended settings, and gotchas — so you can build the right workflow instead of guessing. Names are validated (no path traversal) and must match an existing skill directory.\n' +
       '- action:"generate_skill" — MUTATING: it WRITES to the read-through skill cache on every cache miss, and when `install_in` is set it ALSO creates that directory and overwrites any SKILL.md in it. Generate a Claude skill (SKILL.md) documenting a ComfyUI custom node pack: its nodes, inputs/outputs, and example workflows. `source` accepts a ComfyUI Registry ID (resolved via api.comfy.org) or a GitHub repository URL. Uses a read-through cache under ~/.comfyui-mcp/skill-cache (override COMFYUI_SKILL_CACHE_DIR); set refresh:true to bypass it. On cache miss, fetches the repo README and scans its Python NODE_CLASS_MAPPINGS and example workflows over the network (uses GITHUB_TOKEN if set to avoid rate limits), so internet access is required. If a ComfyUI server is reachable it enriches node input/output types from /object_info, but the server is optional. Returns the SKILL.md markdown with structured cache metadata; if install_in is set, also creates that directory (recursively) and writes SKILL.md there, overwriting any existing file.',
     {
@@ -1069,10 +1119,9 @@ function readSkillAction(rawName: string): ToolText {
       ],
     };
   }
-  // Must resolve to an existing skill dir (defense in depth alongside the regex).
-  const dir = join(skillsDir(), name);
-  const resolvedRoot = skillsDir();
-  if (!dir.startsWith(resolvedRoot) || !existsSync(dir) || !statSync(dir).isDirectory()) {
+  // Must resolve to an existing skill dir under one of the roots (defense in
+  // depth alongside the regex; locateSkillDir keeps the path under its root).
+  if (!locateSkillDir(name)) {
     const known = enumerateSkills().map((s) => s.name);
     return {
       isError: true,

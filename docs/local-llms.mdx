@@ -442,6 +442,11 @@ the Ollama / custom-endpoint lane tells the model to do so before building a
 graph for a model family. That holds for the DEFAULT prompt: an override saved in
 the panel's prompt editor is frozen as saved and does not pick up rules added
 later, so re-check an old override against the current default after an update.
+Your OWN skills reach these lanes the same way: set `COMFYUI_MCP_SKILLS_DIRS` to
+one or more directories (path-delimited, like `PATH`) whose sub-directories each
+hold a `SKILL.md` with `name` and `description` frontmatter, and they are listed
+by `skill_list` after the bundled ones, with their origin, and readable by
+`skill_read`. A name clash is settled in favour of the bundled skill.
 The `list_tools` catalog is designed to carry enough
 orientation that agents without that knowledge layer can still find their way.
 
