@@ -26521,9 +26521,11 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
             `The member list of group ${String(target.value)}${title ? ` "${title}"` : ""} is capped (${String(group.node_ids_truncated)}), so switching from it would leave part of the group untouched. Refused. Switch the nodes with panel_set_node_mode, or split the group.`,
           );
         }
-        const members = (Array.isArray(group.node_ids) ? group.node_ids : []).filter(
-          (n): n is number | string => typeof n === "number" || typeof n === "string",
-        );
+        // The live index spells member ids as strings; hand the number on, the form
+        // every other panel tool takes.
+        const members = (Array.isArray(group.node_ids) ? group.node_ids : [])
+          .filter((n): n is number | string => typeof n === "number" || typeof n === "string")
+          .map((n) => (typeof n === "string" && /^\d+$/.test(n) ? Number(n) : n));
         const mode = String(args.mode);
         if (members.length === 0) {
           return {

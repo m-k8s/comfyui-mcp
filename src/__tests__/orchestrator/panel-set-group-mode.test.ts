@@ -19,8 +19,10 @@ type Sent = Array<Record<string, unknown>>;
 
 function harness(opts: { groups?: unknown[]; failOnNode?: number; truncated?: boolean } = {}) {
   const sent: Sent = [];
+  // The live groups index spells member ids as STRINGS ("10"); the tool hands
+  // numbers on, the form every other panel tool takes.
   const groups = opts.groups ?? [
-    { id: 3, title: "Refiner", node_ids: [10, 11] },
+    { id: 3, title: "Refiner", node_ids: ["10", "11"] },
     { id: 4, title: "Upscale", node_ids: [20] },
   ];
   const bridge = {
