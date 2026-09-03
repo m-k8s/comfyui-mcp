@@ -1245,7 +1245,17 @@ export class OllamaBackend implements AgentBackend {
           this.api === "openai"
           ? fetch(`${this.host}/chat/completions`, {
               method: "POST",
-              headers: { "content-type": "application/json", ...this.authHeaders() },
+              headers: {
+                "content-type": "application/json",
+                ...this.authHeaders(),
+                // Local patch: when the endpoint is a LiteLLM proxy exporting to
+                // Langfuse, every request header prefixed `langfuse_` becomes
+                // trace metadata. Sending the conversation id groups the turns
+                // of one panel chat under a single Langfuse session; any other
+                // OpenAI-compatible endpoint simply ignores the headers.
+                ...(this.sessionId ? { langfuse_session_id: this.sessionId } : {}),
+                langfuse_tags: JSON.stringify(["comfyui-mcp", "panel"]),
+              },
               body: JSON.stringify({
                 model,
                 messages: toOpenAiMessages(messages),
