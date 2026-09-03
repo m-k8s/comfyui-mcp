@@ -140,6 +140,7 @@ describe("visualize_workflow registration", () => {
       "mermaid",
       "render",
       "render_hierarchical",
+      "to_code",
       "to_dsl",
     ]);
     expect(json.required).toEqual(["action"]);
@@ -223,6 +224,43 @@ describe("visualize_workflow actions call the same services with the same argume
     expect(res.content).toHaveLength(2);
     expect(res.content[0].text).toContain("Converted mermaid to workflow: 1 nodes");
     expect(JSON.parse(res.content[1].text)).toEqual(GRAPH);
+  });
+
+  it('action:"to_code" renders API-format JSON as topological pseudo-Python', async () => {
+    const res = await handler()({ action: "to_code", workflow: GRAPH });
+    expect(res.isError).toBeUndefined();
+    expect(text(res)).toMatch(/^# WORKFLOW: 1 nodes/);
+    expect(text(res)).toContain("SaveImage(");
+    expect(mocks.getObjectInfo).toHaveBeenCalled();
+  });
+
+  it('action:"to_code" converts UI format and lists the nodes the canvas has switched off', async () => {
+    mocks.isUiFormat.mockReturnValue(true);
+    mocks.convertUiToApi.mockReturnValue({ workflow: GRAPH, warnings: [] });
+    const ui = {
+      nodes: [
+        { id: 1, type: "SaveImage", mode: 0 },
+        { id: 2, type: "LoraLoaderModelOnly", mode: 4, title: "Skin detail" },
+        { id: 3, type: "PreviewImage", mode: 2 },
+      ],
+      links: [],
+    };
+    const res = await handler()({ action: "to_code", workflow: ui });
+    expect(text(res)).toContain("SaveImage(");
+    // Bypassed and muted nodes are absent from the executable graph, and a
+    // rendering that dropped them silently would hide the exact thing that
+    // explains a "why is my LoRA not applied" question.
+    expect(text(res)).toContain('2 LoraLoaderModelOnly "Skin detail" [bypass]');
+    expect(text(res)).toContain("3 PreviewImage [mute]");
+    expect(text(res)).not.toContain("1 SaveImage [");
+  });
+
+  it('action:"to_code" still renders, without signatures, when ComfyUI is unreachable', async () => {
+    mocks.getObjectInfo.mockRejectedValueOnce(new Error("ECONNREFUSED"));
+    const res = await handler()({ action: "to_code", workflow: GRAPH });
+    expect(res.isError).toBeUndefined();
+    expect(text(res)).toContain("SaveImage(");
+    expect(text(res)).not.toContain("Signatures");
   });
 
   it('action:"to_dsl" hands the graph object straight to workflowToDsl', async () => {

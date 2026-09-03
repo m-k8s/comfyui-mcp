@@ -15,6 +15,8 @@ import {
 } from "../services/hierarchical-mermaid.js";
 import { isUiFormat, convertUiToApi } from "../services/workflow-converter.js";
 import { workflowToDslAction, dslToWorkflowAction } from "./workflow-dsl.js";
+import { workflowToCode } from "../services/workflow-code.js";
+import type { ObjectInfo } from "../comfyui/types.js";
 
 function parseWorkflow(input: unknown): WorkflowJSON {
   if (typeof input === "string") {
@@ -79,12 +81,13 @@ export function registerWorkflowVisualizeTools(server: McpServer): void {
       '- action:"render_hierarchical" — the same graph SECTIONED rather than flat, which is what you want past ~20 nodes. `view` picks a compact overview, one section in detail, a text listing, or an AI-oriented structured summary.\n' +
       '- action:"mermaid" — the INVERSE of render: a Mermaid flowchart back into executable API-format workflow JSON, wired from /object_info schemas.\n' +
       '- action:"to_dsl" — API-format JSON into the compact, human/LLM-readable authoring DSL: `key <- nodeId.outputIndex` for connections, `key = <JSON>` for literals. Round-trips losslessly. (Experimental.)\n' +
-      '- action:"from_dsl" — that DSL back into executable JSON, plus advisory wiring warnings when ComfyUI is reachable (the conversion succeeds either way). (Experimental.)',
+      '- action:"from_dsl" — that DSL back into executable JSON, plus advisory wiring warnings when ComfyUI is reachable (the conversion succeeds either way). (Experimental.)\n' +
+      '- action:"to_code" — pseudo-Python in dependency order, links as variables.',
     {
       action: z
-        .enum(["render", "render_hierarchical", "mermaid", "to_dsl", "from_dsl"])
+        .enum(["render", "render_hierarchical", "mermaid", "to_dsl", "from_dsl", "to_code"])
         .describe(
-          'Which rendering/conversion to perform. "render", "render_hierarchical" and "to_dsl" require `workflow`; ' +
+          'Which rendering/conversion to perform. "render", "render_hierarchical", "to_dsl" and "to_code" require `workflow`; ' +
             '"mermaid" requires `mermaid`; "from_dsl" requires `dsl`.',
         ),
       workflow: z
@@ -212,6 +215,47 @@ export function registerWorkflowVisualizeTools(server: McpServer): void {
             // same DSL the equivalent object produces. The equivalence is pinned
             // in workflow-visualize.test.ts rather than asserted here.
             return workflowToDslAction(parseWorkflow(requireWorkflow("to_dsl")));
+          case "to_code": {
+            let parsed = parseWorkflow(requireWorkflow("to_code"));
+            // The signatures preamble is worth ~10 points of readability in the
+            // ComfyBench ablation, but it is an enrichment: a graph must still
+            // render when ComfyUI is down. Only a UI-format input NEEDS
+            // /object_info, because naming its positional widget values does.
+            let objectInfo: ObjectInfo | undefined;
+            try {
+              objectInfo = await getObjectInfo();
+            } catch {
+              // unknown-ok: rendered without the typed preamble
+              objectInfo = undefined;
+            }
+            // Bypassed and muted nodes are absent from the executable graph, and a
+            // rendering that dropped them silently would hide the exact thing that
+            // answers "why is my LoRA not applied".
+            const switchedOff: string[] = [];
+            if (isUiFormat(parsed)) {
+              for (const raw of (parsed as { nodes?: unknown[] }).nodes ?? []) {
+                const n = raw as { id?: unknown; type?: unknown; title?: unknown; mode?: unknown };
+                const tag = n.mode === 4 ? "[bypass]" : n.mode === 2 ? "[mute]" : undefined;
+                if (!tag) continue;
+                const title = typeof n.title === "string" && n.title ? ` ${JSON.stringify(n.title)}` : "";
+                switchedOff.push(`${String(n.id)} ${String(n.type)}${title} ${tag}`);
+              }
+              if (!objectInfo) {
+                throw new ValidationError(
+                  'visualize_workflow action:"to_code" needs ComfyUI\'s /object_info to name the widget values of a UI-format workflow. Start ComfyUI, or pass the API-format JSON.',
+                );
+              }
+              parsed = convertUiToApi(parsed as never, objectInfo).workflow;
+            }
+            let code = workflowToCode(parsed, objectInfo);
+            if (switchedOff.length > 0) {
+              code +=
+                "\n# Switched off on the canvas, so absent from the executable graph above:\n" +
+                switchedOff.map((line) => `#   ${line}`).join("\n") +
+                "\n";
+            }
+            return { content: [{ type: "text", text: code }] };
+          }
           case "from_dsl": {
             if (args.dsl === undefined) {
               throw new Error(
@@ -225,7 +269,7 @@ export function registerWorkflowVisualizeTools(server: McpServer): void {
             // silent undefined if the schema and switch ever drift apart.
             const exhaustive: never = args.action;
             throw new Error(
-              `Unknown visualize_workflow action "${String(exhaustive)}". Expected one of: render, render_hierarchical, mermaid, to_dsl, from_dsl.`,
+              `Unknown visualize_workflow action "${String(exhaustive)}". Expected one of: render, render_hierarchical, mermaid, to_dsl, from_dsl, to_code.`,
             );
           }
         }
