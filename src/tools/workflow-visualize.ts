@@ -16,6 +16,7 @@ import {
 import { isUiFormat, convertUiToApi } from "../services/workflow-converter.js";
 import { workflowToDslAction, dslToWorkflowAction } from "./workflow-dsl.js";
 import { workflowToCode } from "../services/workflow-code.js";
+import { codeToWorkflow } from "../services/workflow-code-compose.js";
 import type { ObjectInfo } from "../comfyui/types.js";
 
 function parseWorkflow(input: unknown): WorkflowJSON {
@@ -80,15 +81,15 @@ export function registerWorkflowVisualizeTools(server: McpServer): void {
       '- action:"render" — Mermaid flowchart of the whole graph: nodes grouped by category, connections labeled by data type.\n' +
       '- action:"render_hierarchical" — the same graph SECTIONED rather than flat, which is what you want past ~20 nodes. `view` picks a compact overview, one section in detail, a text listing, or an AI-oriented structured summary.\n' +
       '- action:"mermaid" — the INVERSE of render: a Mermaid flowchart back into executable API-format workflow JSON, wired from /object_info schemas.\n' +
-      '- action:"to_dsl" — API-format JSON into the compact, human/LLM-readable authoring DSL: `key <- nodeId.outputIndex` for connections, `key = <JSON>` for literals. Round-trips losslessly. (Experimental.)\n' +
-      '- action:"from_dsl" — that DSL back into executable JSON, plus advisory wiring warnings when ComfyUI is reachable (the conversion succeeds either way). (Experimental.)\n' +
-      '- action:"to_code" — pseudo-Python in dependency order, links as variables.',
+      '- action:"to_dsl" — API-format JSON into the compact, human/LLM-readable authoring DSL: `key <- nodeId.outputIndex` for connections, `key = <JSON>` for literals. Round-trips losslessly.\n' +
+      '- action:"from_dsl" — that DSL back into executable JSON, plus advisory wiring warnings when ComfyUI is reachable (the conversion succeeds either way).\n' +
+      '- action:"to_code" / "from_code" — pseudo-Python in dependency order, links as variables, and back.',
     {
       action: z
-        .enum(["render", "render_hierarchical", "mermaid", "to_dsl", "from_dsl", "to_code"])
+        .enum(["render", "render_hierarchical", "mermaid", "to_dsl", "from_dsl", "to_code", "from_code"])
         .describe(
           'Which rendering/conversion to perform. "render", "render_hierarchical", "to_dsl" and "to_code" require `workflow`; ' +
-            '"mermaid" requires `mermaid`; "from_dsl" requires `dsl`.',
+            '"mermaid" requires `mermaid`; "from_dsl" requires `dsl`; "from_code" requires `code`.',
         ),
       workflow: z
         .union([z.string(), z.record(z.string(), z.any())])
@@ -135,6 +136,12 @@ export function registerWorkflowVisualizeTools(server: McpServer): void {
             "Connections should be labeled with data types (e.g., -->|MODEL|).",
         ),
       dsl: z.string().optional().describe('action:"from_dsl" (REQUIRED) — Workflow DSL text'),
+      code: z
+        .string()
+        .optional()
+        .describe(
+          'action:"from_code" (REQUIRED) — pseudo-Python text in the shape action:"to_code" renders: one `outputs = Class(input=variable, value=literal)` line per node.',
+        ),
     },
     async (args) => {
       try {
@@ -256,6 +263,30 @@ export function registerWorkflowVisualizeTools(server: McpServer): void {
             }
             return { content: [{ type: "text", text: code }] };
           }
+          case "from_code": {
+            if (args.code === undefined) {
+              throw new ValidationError(
+                'visualize_workflow action:"from_code" requires `code` — the pseudo-Python text to build the workflow from.',
+              );
+            }
+            // Signatures resolve `clip=clip_1` to the CLIP output's slot; without
+            // them only `out<slot>_<id>` variables name a slot, which is still a
+            // complete graph, so an unreachable ComfyUI does not refuse the build.
+            let objectInfo: ObjectInfo | undefined;
+            try {
+              objectInfo = await getObjectInfo();
+            } catch {
+              // unknown-ok: built without signatures
+              objectInfo = undefined;
+            }
+            const built = codeToWorkflow(args.code, objectInfo);
+            if (built.problems.length > 0) {
+              throw new ValidationError(
+                `Refused, nothing built. Fix these lines and resend the whole fragment:\n${built.problems.map((p) => `- ${p}`).join("\n")}`,
+              );
+            }
+            return { content: [{ type: "text", text: JSON.stringify(built.workflow, null, 2) }] };
+          }
           case "from_dsl": {
             if (args.dsl === undefined) {
               throw new Error(
@@ -269,7 +300,7 @@ export function registerWorkflowVisualizeTools(server: McpServer): void {
             // silent undefined if the schema and switch ever drift apart.
             const exhaustive: never = args.action;
             throw new Error(
-              `Unknown visualize_workflow action "${String(exhaustive)}". Expected one of: render, render_hierarchical, mermaid, to_dsl, from_dsl, to_code.`,
+              `Unknown visualize_workflow action "${String(exhaustive)}". Expected one of: render, render_hierarchical, mermaid, to_dsl, from_dsl, to_code, from_code.`,
             );
           }
         }

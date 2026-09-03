@@ -213,6 +213,7 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
     // last test in this file requires of a claimant.
     "get_workflow",
     "panel_canvas",
+    "panel_compose_workflow",
     "panel_configure_app_mode",
     "panel_enter_subgraph",
     "panel_find_nodes",
@@ -252,6 +253,7 @@ describe("graph-reading tool descriptions are distinguishable (#557)", () => {
     ["panel_strip_workflow", "TRANSFORMS a graph into a resolved form; the result is a conversion, not a view"],
     ["panel_load_workflow", "WRITES the canvas (replaces the open graph); nothing about it answers a read"],
     ["panel_configure_app_mode", "WRITES App Mode metadata (extra.linearData/linearMode) onto the open graph; nothing about it answers a read"],
+    ["panel_compose_workflow", "WRITES nodes and links onto the open graph from a code fragment; it names the canvas as the target of a write, never as something it shows"],
     ["panel_run", "QUEUES the open workflow — the canvas is the input, not the output"],
     ["panel_kitchen", "ASSESSES/applies comfy-kitchen kernels on the open graph; the canvas is the input, not a view"],
     ["panel_get_workflow_target", "reads the agent's BINDING (current vs pinned), not the graph's contents"],

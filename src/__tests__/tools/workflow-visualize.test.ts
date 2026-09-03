@@ -127,6 +127,7 @@ describe("visualize_workflow registration", () => {
     };
     expect(Object.keys(json.properties ?? {}).sort()).toEqual([
       "action",
+      "code",
       "direction",
       "dsl",
       "mermaid",
@@ -136,6 +137,7 @@ describe("visualize_workflow registration", () => {
       "workflow",
     ]);
     expect(json.properties?.action.enum?.sort()).toEqual([
+      "from_code",
       "from_dsl",
       "mermaid",
       "render",
@@ -261,6 +263,30 @@ describe("visualize_workflow actions call the same services with the same argume
     expect(res.isError).toBeUndefined();
     expect(text(res)).toContain("SaveImage(");
     expect(text(res)).not.toContain("Signatures");
+  });
+
+  it('action:"from_code" builds API-format JSON from the pseudo-Python, ids kept from the variables', async () => {
+    const res = await handler()({
+      action: "from_code",
+      code: 'model_1, clip_1, vae_1 = CheckpointLoaderSimple(ckpt_name="a.safetensors")\nSaveImage(images=out0_1)',
+    });
+    expect(res.isError).toBeUndefined();
+    const wf = JSON.parse(res.content[0].text);
+    expect(wf["1"]).toEqual({ class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "a.safetensors" } });
+    expect(wf["2"]).toEqual({ class_type: "SaveImage", inputs: { images: ["1", 0] } });
+  });
+
+  it('action:"from_code" refuses with the offending lines instead of a partial graph', async () => {
+    const res = await handler()({ action: "from_code", code: "x = Foo(a=1)\ny = Bar(1)" });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toMatch(/line 2/);
+    expect(text(res)).not.toMatch(/"class_type"/);
+  });
+
+  it('action:"from_code" requires `code`', async () => {
+    const res = await handler()({ action: "from_code" });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toMatch(/requires `code`/);
   });
 
   it('action:"to_dsl" hands the graph object straight to workflowToDsl', async () => {

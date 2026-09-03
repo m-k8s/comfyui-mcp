@@ -202,8 +202,11 @@ import {
 import {
   contentOnlyRootShapeReadNote,
   isContentOnlyRootShapeMismatch,
+  readLiveUiGraphForContentDrift,
   recoverContentOnlyGraphQuery,
+  uiGraphToApiGraph,
 } from "./root-shape-mismatch.js";
+import { composeFromCode, type Operation as ComposeOperation } from "../services/workflow-code-compose.js";
 import type { GraphQueryOptions } from "../services/graph-query.js";
 import {
   clearSwitchHold,
@@ -457,6 +460,7 @@ import {
 import {
   getClient,
   getLogs,
+  getObjectInfo,
   getQueueVerified,
   resetClient,
   resetObjectInfoCache,
@@ -21658,6 +21662,142 @@ export function buildPanelToolDefs(): PanelToolDef[] {
         input: slotRef.optional().describe("Input slot name or index (default 0)."),
       },
       async (args: A, ctx) => ctx.call({ cmd: "graph_disconnect", node_id: args.node_id, input: args.input }),
+    ),
+    def(
+      "panel_compose_workflow",
+      "Compose a FRAGMENT of the user's open graph by writing the pseudo-Python that panel_graph_outline / visualize_workflow (action:\"to_code\") render: one `outputs = Class(input=variable, value=literal)` line per node. " +
+        "A variable `<output>_<node id>` (e.g. `model_50`, `out1_50`) is a LINK to that existing node's output; a line whose target names an existing node MODIFIES it (values, rewiring), a line whose target is new CREATES a node; variables assigned earlier in the fragment can be used below. " +
+        "The whole plan is checked first and NOTHING is applied while any line is refused (the refusal names the line). Several nodes and links in one call, one undo step each. Set `dry_run: true` to see the plan without applying it.",
+      {
+        code: z.string().describe("The fragment: assignments `a, b = Class(...)` and bare calls `Class(...)`, one per line; `#` comments allowed."),
+        dry_run: z.boolean().optional().describe("Return the plan and problems without touching the graph."),
+      },
+      async (args: A, ctx) => {
+        const code = String(args.code ?? "");
+        const live = await readLiveUiGraphForContentDrift((cmd, timeoutMs) => ctx.call(cmd, timeoutMs));
+        if (!live) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: "Could not read the live graph to resolve the fragment's variables against; nothing applied." }],
+          };
+        }
+        const existing = uiGraphToApiGraph(live.nodes);
+        let objectInfo: ObjectInfo | undefined;
+        try {
+          objectInfo = await getObjectInfo();
+        } catch {
+          // unknown-ok: composed without signatures; only out<slot>_<id> names a slot
+          objectInfo = undefined;
+        }
+        const plan = composeFromCode(code, { existing, objectInfo });
+        const planText = plan.plan.length ? plan.plan.map((l) => `- ${l}`).join("\n") : "(nothing to do)";
+        if (plan.problems.length > 0) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text:
+                  `Refused, nothing applied. Fix these lines and resend the whole fragment:\n${plan.problems.map((p) => `- ${p}`).join("\n")}` +
+                  `\n\nPlan the valid lines would have run:\n${planText}`,
+              },
+            ],
+          };
+        }
+        if (args.dry_run === true) {
+          return { content: [{ type: "text", text: `Dry run, nothing applied. Plan:\n${planText}` }] };
+        }
+
+        // Provisional ids become the ids the canvas hands back.
+        const realId = new Map<string, string | number>();
+        const wire = (id: string): string | number => realId.get(id) ?? (/^\d+$/.test(id) ? Number(id) : id);
+        const created: Array<{ provisional: string; node_id: string | number; class_type: string }> = [];
+        const applied: string[] = [];
+        const describe = (op: ComposeOperation): string =>
+          op.op === "add_node"
+            ? `add ${op.class_type}`
+            : op.op === "set_widget"
+              ? `set ${String(wire(op.node))}.${op.name}`
+              : `connect ${String(wire(op.from))}[${op.from_slot}] -> ${String(wire(op.to))}.${op.to_input}`;
+        const step = async (label: string, cmd: Record<string, unknown>): Promise<Record<string, unknown>> => {
+          let res: ToolResult;
+          try {
+            res = await ctx.call(cmd);
+          } catch (err) {
+            throw new Error(`${label}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+          const text = toolResultText(res);
+          if (res.isError) throw new Error(`${label}: ${text}`);
+          try {
+            const parsed: unknown = JSON.parse(text);
+            return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+          } catch {
+            return {};
+          }
+        };
+        try {
+          for (const op of plan.operations) {
+            const label = describe(op);
+            if (op.op === "add_node") {
+              const reply = await step(label, { cmd: "graph_add_node", class_type: op.class_type });
+              const id = reply.node_id;
+              if (typeof id !== "number" && typeof id !== "string") {
+                throw new Error(`${label}: the canvas did not return the new node's id.`);
+              }
+              realId.set(op.node, id);
+              created.push({ provisional: op.node, node_id: id, class_type: op.class_type });
+              applied.push(label);
+              for (const [widget, value] of Object.entries(op.widgets)) {
+                await step(`set ${String(id)}.${widget}`, { cmd: "graph_set_widget", node_id: id, widget, value });
+                applied.push(`set ${String(id)}.${widget}`);
+              }
+            } else if (op.op === "set_widget") {
+              await step(label, { cmd: "graph_set_widget", node_id: wire(op.node), widget: op.name, value: op.value });
+              applied.push(label);
+            } else {
+              await step(label, {
+                cmd: "graph_connect",
+                from_node_id: wire(op.from),
+                from_output: op.from_slot,
+                to_node_id: wire(op.to),
+                to_input: op.to_input,
+                auto_match: false,
+              });
+              applied.push(label);
+            }
+          }
+        } catch (err) {
+          return {
+            isError: true,
+            content: [
+              {
+                type: "text",
+                text:
+                  `Stopped: ${err instanceof Error ? err.message : String(err)}\n` +
+                  `Applied before the failure (${applied.length} step(s), each undoable with Ctrl+Z):\n${applied.map((l) => `- ${l}`).join("\n") || "- nothing"}\n` +
+                  `Not applied: the remaining steps of the plan.`,
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  ok: true,
+                  created,
+                  steps: applied.length,
+                  plan: plan.plan.map((l) => l.replace(/\b(\d+)\b/g, (m) => String(realId.get(m) ?? m))),
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      },
     ),
     def(
       "panel_set_widget",
