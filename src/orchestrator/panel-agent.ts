@@ -283,6 +283,8 @@ export interface QueueItem {
   /** Audio attachments this item is carrying (#790). */
   audio?: AudioRef[];
   mid?: string;
+  /** Incognito: the user asked for this message not to be kept (see NeutralTurn). */
+  incognito?: boolean;
   /** Run-completion journal tokens this item is carrying (#468). */
   eventTokens?: string[];
   /** True when this item is NOTHING BUT an injected panel event — its whole text
@@ -323,6 +325,8 @@ export interface InFlightTurn {
    *  token had been handed back and replayed elsewhere — one completion, two
    *  agent turns, the second indistinguishable from a real one. */
   items: QueueItem[];
+  /** True when any batched item was incognito: the whole turn is then treated so. */
+  incognito?: boolean;
 }
 
 export interface PanelAgentDeps {
@@ -346,6 +350,9 @@ export interface PanelAgentDeps {
   /** Report the SDK session id once known, so the panel can persist/resume it.
    *  `model` is the SDK-resolved model (#376), used to correct the ready banner. */
   onSession?: (tabId: string, sessionId: string, model?: string) => void;
+  /** Incognito: called with the live session id when an incognito turn ends, so
+   *  the caller can delete what the backend wrote for it (the Claude session file). */
+  forgetSession?: (sessionId: string) => void;
   /** #1516 — the cumulative automatic-preview ledger changed (previews were
    *  committed to a turn, or delivery stopped at the budget). The manager
    *  persists it beside the session id so an orchestrator RESTART does not
@@ -640,6 +647,8 @@ export class PanelAgent {
        *  detach logic can no longer remove from held mail, so its text survives
        *  after its token has been replayed elsewhere — one completion, two turns. */
       completionOnly?: boolean;
+      /** Incognito: keep nothing of this message (see NeutralTurn). */
+      incognito?: boolean;
     },
   ): void {
     if (opts?.title) this.title = opts.title;
@@ -648,6 +657,7 @@ export class PanelAgent {
       images: opts?.images,
       audio: opts?.audio,
       mid: opts?.mid,
+      ...(opts?.incognito ? { incognito: true } : {}),
       ...(opts?.completionOnly ? { completionOnly: true } : {}),
       ...(opts?.eventTokens?.length ? { eventTokens: [...opts.eventTokens] } : {}),
     });
@@ -666,6 +676,17 @@ export class PanelAgent {
     const turn = this.inFlight;
     this.inFlight = null;
     return turn;
+  }
+
+  /** An incognito turn has ended (completed, stalled, or abandoned): hand the
+   *  live session id to the deleter, so what the backend wrote for it goes. */
+  private forgetIfIncognito(turn: InFlightTurn | null): void {
+    if (!turn?.incognito || !this.sessionId) return;
+    try {
+      this.deps.forgetSession?.(this.sessionId);
+    } catch (err) {
+      logger.warn(`[panel-agent ${this.short()}] forgetting incognito session: ${msgOf(err)}`);
+    }
   }
 
   private releaseEventTokens(tokens: string[] | undefined, opts: { carried?: boolean } = {}): void {
@@ -1788,11 +1809,15 @@ export class PanelAgent {
         this.releaseEventTokens(stale, { carried: this.turnProducedEvents });
       }
       this.turnEventTokens = carriedTokens;
+      // One incognito item makes the whole batched turn incognito: the backend
+      // sees a single turn, and half-kept is not kept.
+      const incognito = batch.some((item) => item.incognito === true);
       this.inFlight = {
         text,
         ...(images.length ? { images } : {}),
         ...(audio.length ? { audio } : {}),
         ...(carriedTokens.length ? { eventTokens: carriedTokens } : {}),
+        ...(incognito ? { incognito: true } : {}),
         items: batch,
       };
       this.yieldedTurns += 1; // this batch is turn N
@@ -1826,7 +1851,12 @@ export class PanelAgent {
       // Subsequent events re-arm it (handleEvent → bumpIdleWatchdog); a clean
       // result disarms it.
       this.bumpIdleWatchdog();
-      yield { text, ...(images.length ? { images } : {}), ...(audio.length ? { audio } : {}) };
+      yield {
+        text,
+        ...(images.length ? { images } : {}),
+        ...(audio.length ? { audio } : {}),
+        ...(incognito ? { incognito: true } : {}),
+      };
       // Hold the next batch until THIS turn completes. Race-free: if the result
       // already fired (completedTurns caught up) we don't park at all, so the
       // channel can never deadlock and strand later messages.
@@ -2052,6 +2082,7 @@ export class PanelAgent {
     // The stalled turn is abandoned — don't re-queue its text (a wedged message
     // could otherwise loop on every interrupt, and it may already have performed
     // tool side effects).
+    this.forgetIfIncognito(this.inFlight);
     this.inFlight = null;
     // …but a run COMPLETION the abandoned turn was carrying is not the agent's
     // work, it's news the agent still needs (#468). Hand its tokens back so the
@@ -2382,6 +2413,7 @@ export class PanelAgent {
         this.busy = false;
         // Turn completed → nothing to re-queue on a later interrupt. (A clean
         // completion must NOT have its message re-queued.)
+        this.forgetIfIncognito(this.inFlight);
         this.inFlight = null;
         // #468 — the turn that CARRIED the run completion(s) has ended, so they
         // demonstrably reached the model's context. Ack them: the journal drops
@@ -2501,6 +2533,9 @@ export interface PanelAgentManagerOptions {
   onStream?: (tabId: string, ev: StreamDelta) => void;
   onStatus?: (tabId: string, status: UsageStatus) => void;
   onSession?: (tabId: string, sessionId: string, model?: string) => void;
+  /** Incognito: called with the live session id when an incognito turn ends, so
+   *  the caller can delete what the backend wrote for it (the Claude session file). */
+  forgetSession?: (sessionId: string) => void;
   onTurnAnchor?: (tabId: string, uuid: string) => void;
   onTurn?: (tabId: string, state: "working" | "done") => void;
   /** Live extended-thinking token count, for a "thinking… (N)" indicator. */
@@ -2630,6 +2665,8 @@ export function tallyRestart(tally: McpEnvRestartTally, outcome: McpEnvRestartOu
 /** Owns one PanelAgent per tab id, spawned lazily on the tab's first message. */
 export class PanelAgentManager {
   private agents = new Map<string, PanelAgent>();
+  /** Tabs whose LATEST message was incognito: their session start is not recorded durably. */
+  private incognitoTabs = new Set<string>();
   private opts: PanelAgentManagerOptions;
   /** Per-tab session id to resume on the next spawn (reload restore). */
   private pendingResume = new Map<string, string>();
@@ -2720,9 +2757,12 @@ export class PanelAgentManager {
       // Persist the session id to our durable store (resume-after-restart) BEFORE
       // forwarding it to the panel — so it's on disk the moment the SDK reports it.
       onSession: (id, sid, model) => {
-        this.opts.sessionStore?.set(id, sid, this.opts.identityForKey?.(id));
+        // Incognito: the durable resume index is a record of the conversation;
+        // a tab whose latest message asked not to be kept gets none.
+        if (!this.incognitoTabs.has(id)) this.opts.sessionStore?.set(id, sid, this.opts.identityForKey?.(id));
         this.opts.onSession?.(id, sid, model);
       },
+      forgetSession: this.opts.forgetSession,
       // #1516 — persist the cumulative preview ledger beside the session id it
       // belongs to. setPreviewLedger REFUSES a session mismatch, so a ledger is
       // only ever stored against the exact conversation it measures — a stale
@@ -3708,7 +3748,7 @@ export class PanelAgentManager {
   send(
     tabId: string,
     text: string,
-    meta?: { title?: string; images?: ImageRef[]; audio?: AudioRef[]; mid?: string },
+    meta?: { title?: string; images?: ImageRef[]; audio?: AudioRef[]; mid?: string; incognito?: boolean },
   ): void {
     let agent = this.agents.get(tabId);
     if (agent?.isStopped) {
@@ -3744,7 +3784,17 @@ export class PanelAgentManager {
       this.pendingResume.delete(tabId);
       agent = this.spawn(tabId, resume);
     }
-    agent.send(text, { title: meta?.title, images: meta?.images, audio: meta?.audio, mid: meta?.mid });
+    // The tab's LATEST message decides whether its next session start is recorded
+    // (onSession consults this set); the message itself carries the flag downstream.
+    if (meta?.incognito === true) this.incognitoTabs.add(tabId);
+    else this.incognitoTabs.delete(tabId);
+    agent.send(text, {
+      title: meta?.title,
+      images: meta?.images,
+      audio: meta?.audio,
+      mid: meta?.mid,
+      ...(meta?.incognito === true ? { incognito: true } : {}),
+    });
   }
 
   /**

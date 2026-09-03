@@ -11,6 +11,7 @@
 // This is Claude-backend-specific (JSONL shape). Other backends return an empty
 // list — history parity is a Claude feature for now.
 
+import { unlinkSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -33,9 +34,33 @@ export interface HistoryMessage {
 
 /** The Claude projects dir for the current working directory. Claude encodes the
  *  cwd by replacing `:`, `\` and `/` with `-` (e.g. C:\Users\a\b → C--Users-a-b). */
-function projectDir(cwd: string): string {
+function projectDir(cwd: string, home: string = homedir()): string {
   const encoded = cwd.replace(/[:\\/]/g, "-");
-  return join(homedir(), ".claude", "projects", encoded);
+  return join(home, ".claude", "projects", encoded);
+}
+
+const SESSION_ID = /^[A-Za-z0-9._-]+$/;
+
+/** Where the Agent SDK writes the transcript of `sessionId` for an agent run from `cwd`. */
+export function claudeSessionFile(sessionId: string, cwd: string, home: string = homedir()): string {
+  if (!SESSION_ID.test(sessionId)) throw new Error(`not a session id: ${JSON.stringify(sessionId)}`);
+  return join(projectDir(cwd, home), `${sessionId}.jsonl`);
+}
+
+/**
+ * Incognito: delete the transcript the Agent SDK wrote for `sessionId`, so the
+ * conversation is neither listed by listSessions nor resumable from disk.
+ * Returns whether a file was deleted. The id is validated as a plain id first:
+ * this function unlinks, and must never be handed a path.
+ */
+export function forgetClaudeSession(sessionId: string, cwd: string, home: string = homedir()): boolean {
+  const file = claudeSessionFile(sessionId, cwd, home);
+  try {
+    unlinkSync(file);
+    return true;
+  } catch {
+    return false; // unknown-ok: nothing on disk for this session (yet, or any more)
+  }
 }
 
 /** Pull the plain text out of a Claude message `content` (string or block array),

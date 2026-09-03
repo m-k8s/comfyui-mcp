@@ -97,7 +97,7 @@ import {
   makeScopeRepinHandler,
   makeScopeTargetResolver,
 } from "./turn-origins.js";
-import { listSessions, loadTranscript } from "./history.js";
+import { forgetClaudeSession, listSessions, loadTranscript } from "./history.js";
 import { uploadImageHttp, resetClient } from "../comfyui/client.js";
 import {
   setConnectedPanelFallbackOrigins,
@@ -2817,6 +2817,12 @@ export async function runPanelOrchestrator(): Promise<void> {
     // Report the SDK session id so the panel can persist it and resume on reload.
     // (The orchestrator's own disk store — written by the manager before this
     // fires — is authoritative; the panel copy is a last-resort hint.)
+    // Incognito: the Agent SDK wrote this session's transcript under
+    // ~/.claude/projects/<cwd>; it is the history listSessions serves, so it goes.
+    forgetSession: (sessionId) => {
+      const gone = forgetClaudeSession(sessionId, process.cwd());
+      logger.info(`[panel-orchestrator] incognito turn ended — session ${sessionId.slice(0, 8)} transcript ${gone ? "deleted" : "not on disk"}`);
+    },
     onSession: (key, sessionId, model) => {
       pushToConversation(key, { type: "session", session_id: sessionId });
       bridge.broadcastTabList(); // a session started/changed → refresh mirror pickers
@@ -5983,8 +5989,13 @@ export async function runPanelOrchestrator(): Promise<void> {
     bridge.push({ type: "ack", ok: true, kind: "working", ...(userMid ? { mid: userMid } : {}) }, event.tab_id);
     // Show the working indicator immediately (before the first assistant token).
     bridge.push({ type: "turn", state: "working" }, event.tab_id);
+    // Incognito (the panel's toggle): keep nothing of this turn — the log quotes no
+    // text, the durable resume index skips the session, the Ollama transcript dump
+    // is skipped, and the Claude session file is deleted when the turn ends.
+    // Langfuse on the custom lane's proxy stays: it is the user's own choice.
+    const incognito = (event as { incognito?: unknown }).incognito === true;
     logger.info(
-      `[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} → agent: ${event.text.slice(0, 80)}`,
+      `[panel-orchestrator] tab ${event.tab_id.slice(0, 8)} → agent: ${incognito ? "[incognito, text withheld]" : event.text.slice(0, 80)}`,
     );
     // AUTO CRASH-DUMP (Part A): the panel's post-restart resume nudges are
     // auto-generated "✅ … restarted/reconnected … continue …" messages. When one
@@ -6129,6 +6140,7 @@ export async function runPanelOrchestrator(): Promise<void> {
       // The panel's own mid, or the synthetic origin mid a mid-less message
       // was given so its turn still pins/stamps at dequeue (#884 gate 3).
       mid: dispatchMid,
+      ...(incognito ? { incognito: true } : {}),
     };
     // Local-agent VRAM pause: if this tab runs a LOCAL Ollama / LM Studio /
     // llama.cpp model AND a render is in flight, DON'T run the turn now — that

@@ -35,6 +35,9 @@ export type BackendId =
  * the "channel in" seam — PanelAgent never deals in `SDKUserMessage`.
  */
 export interface NeutralTurn {
+  /** The user asked for this turn NOT to be kept: no transcript dump, no
+   *  durable session record; the Claude session file is deleted at turn end. */
+  incognito?: boolean;
   /** The combined user text for this turn. */
   text: string;
   /** ComfyUI image refs to deliver inline (vision), resolved by the backend. */

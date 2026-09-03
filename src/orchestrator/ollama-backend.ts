@@ -2257,7 +2257,9 @@ export class OllamaBackend implements AgentBackend {
       }
     } finally {
       if (this.turnAbort === abort) this.turnAbort = null;
-      this.dumpTranscript();
+      // Incognito: the fine-tune datagen snapshot is exactly what the user asked
+      // not to keep.
+      if (!turn.incognito) this.dumpTranscript();
     }
   }
 
