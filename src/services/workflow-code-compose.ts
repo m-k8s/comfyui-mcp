@@ -1,4 +1,5 @@
 import type { ObjectInfo, WorkflowJSON } from "../comfyui/types.js";
+import { callableName } from "./workflow-code.js";
 import { parseCode, type CodeStatement, type CodeValue } from "./workflow-code-parse.js";
 
 /**
@@ -122,6 +123,18 @@ export function composeFromCode(code: string, ctx: ComposeContext): ComposeResul
   // created so far, so `out0_7` can name a node created two lines above.
   const view: WorkflowJSON = { ...existing };
 
+  // `to_code` renders a class whose name is not an identifier, `Image Save`,
+  // as `Image_Save(...)`. Read that spelling back to the real class, looking
+  // among the installed classes first, then among the classes already on the
+  // graph (the only source when object_info is unreachable).
+  const realClass = (written: string): string => {
+    if (objectInfo?.[written] || Object.values(existing).some((n) => n.class_type === written)) return written;
+    const installed = objectInfo ? Object.keys(objectInfo).find((c) => callableName(c) === written) : undefined;
+    if (installed) return installed;
+    const onGraph = Object.values(existing).map((n) => n.class_type).find((c) => callableName(c) === written);
+    return onGraph ?? written;
+  };
+
   const resolve = (name: string, line: number): [string, number] | null => {
     const bound = fresh.get(name);
     if (bound) return bound;
@@ -151,7 +164,8 @@ export function composeFromCode(code: string, ctx: ComposeContext): ComposeResul
   }
 
   function composeStatement(st: CodeStatement): string | null {
-    const { line, classType, targets } = st;
+    const { line, targets } = st;
+    const classType = realClass(st.classType);
 
     // Does the first target name an existing node? Then this line modifies it.
     const first = targets[0];

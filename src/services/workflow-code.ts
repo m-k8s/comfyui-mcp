@@ -25,6 +25,14 @@ import type { ComfyUINodeDef, ObjectInfo, WorkflowJSON } from "../comfyui/types.
 
 const NOT_IDENTIFIER = /[^0-9A-Za-z_]/g;
 
+/**
+ * The callable spelling of a class name: `Image Save` is rendered `Image_Save`.
+ * Exported so the reader can find the class again under that spelling.
+ */
+export function callableName(classType: string): string {
+  return identifier(classType, "Node");
+}
+
 /** A name that holds as an identifier, without losing what it named. */
 function identifier(name: unknown, fallback: string): string {
   const clean = String(name ?? "")
@@ -171,7 +179,7 @@ export function workflowToCode(workflow: WorkflowJSON, objectInfo?: ObjectInfo):
   for (const id of order) {
     const node = workflow[id];
     const classType = String(node.class_type || "Unknown");
-    const callable = identifier(classType, "Node");
+    const callable = callableName(classType);
     const def = objectInfo?.[classType];
 
     const names = outputNames(def);

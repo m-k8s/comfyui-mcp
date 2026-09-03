@@ -148,6 +148,32 @@ describe("composeFromCode: resolving variables", () => {
     expect(r.problems[1]).toMatch(/model, strength/);
   });
 
+  it("finds a class whose name is not an identifier under the spelling to_code gave it", () => {
+    const oi: ObjectInfo = { ...OI, "Image Save": def({ required: { images: ["IMAGE"] } }, []) };
+    const r = composeFromCode(`Image_Save(images=out0_50)`, { existing: EXISTING, objectInfo: oi });
+    expect(r.problems).toEqual([]);
+    expect(r.operations[0]).toMatchObject({ op: "add_node", class_type: "Image Save" });
+  });
+
+  it("modifies an existing node of such a class under the same spelling", () => {
+    const oi: ObjectInfo = { ...OI, "Image Save": def({ required: { images: ["IMAGE"], quality: ["INT"] } }, []) };
+    const existing: WorkflowJSON = { ...EXISTING, "9": { class_type: "Image Save", inputs: { quality: 80 } } };
+    const r = composeFromCode(`out0_9 = Image_Save(quality=95)`, { existing, objectInfo: oi });
+    expect(r.problems).toEqual([]);
+    expect(r.operations).toEqual([{ op: "set_widget", node: "9", name: "quality", value: 95 }]);
+  });
+
+  it("round-trips a graph with such a class through to_code", () => {
+    const oi: ObjectInfo = { ...OI, "Image Save": def({ required: { images: ["IMAGE"] } }, []) };
+    const wf: WorkflowJSON = {
+      "1": { class_type: "CheckpointLoaderSimple", inputs: { ckpt_name: "a.safetensors" } },
+      "2": { class_type: "Image Save", inputs: { images: ["1", 0] } },
+    };
+    const back = codeToWorkflow(workflowToCode(wf, oi), oi);
+    expect(back.problems).toEqual([]);
+    expect(back.workflow).toEqual(wf);
+  });
+
   it("without object_info, creates what it is told and checks nothing it cannot know", () => {
     const r = composeFromCode(`x = Anything(a=1, b=out0_50)`, { existing: EXISTING });
     expect(r.problems).toEqual([]);
