@@ -76,14 +76,15 @@ const TH = {
   colorCast: 12, // spread between channel means above this = cast
 };
 
-interface RawPixels {
+export interface RawPixels {
   data: Buffer;
   width: number;
   height: number;
   channels: number;
 }
 
-async function resolveBytes(opts: AnalyzeColorOptions): Promise<Buffer> {
+/** The bytes of an image named by asset id, ComfyUI filename, or path — shared with image-compare. */
+export async function resolveBytes(opts: AnalyzeColorOptions, feature = 'get_image (action:"analyze_color")'): Promise<Buffer> {
   if (opts.asset_id) {
     const record = AssetRegistry.get(opts.asset_id);
     if (!record) {
@@ -114,7 +115,7 @@ async function resolveBytes(opts: AnalyzeColorOptions): Promise<Buffer> {
   }
 
   throw new ValidationError(
-    'get_image (action:"analyze_color") requires one of: asset_id, filename (+optional subfolder/type), or path.',
+    `${feature} requires one of: asset_id, filename (+optional subfolder/type), or path.`,
   );
 }
 
@@ -133,10 +134,11 @@ async function resolveSafePath(path: string): Promise<string> {
   return resolved;
 }
 
-async function toRaw(bytes: Buffer): Promise<RawPixels> {
+/** Decode to 8-bit sRGB pixels without alpha — shared with image-compare. */
+export async function toRaw(bytes: Buffer, feature = "Colour analysis"): Promise<RawPixels> {
   // #2411 — loaded HERE, not at module scope. A blocked libvips used to throw
   // while this file evaluated, which took every tool registration down with it.
-  const sharp = await requireSharp("Colour analysis");
+  const sharp = await requireSharp(feature);
   const { data, info } = await sharp(bytes, { limitInputPixels: 100_000_000 })
     .removeAlpha()
     .toColourspace("srgb")

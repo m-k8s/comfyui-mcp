@@ -67,6 +67,11 @@ vi.mock("../../services/color-analysis.js", () => ({
   analyzeColor: (...a: unknown[]) => analyzeColorMock(...a),
 }));
 
+const compareImagesMock = vi.fn();
+vi.mock("../../services/image-compare.js", () => ({
+  compareImages: (...a: unknown[]) => compareImagesMock(...a),
+}));
+
 const uploadOutputMock = vi.fn();
 vi.mock("../../services/storage-upload.js", () => ({
   uploadOutput: (...a: unknown[]) => uploadOutputMock(...a),
@@ -183,6 +188,7 @@ describe("image/asset registration", () => {
       "format",
       "histogram",
       "limit",
+      "locate",
       "lossless",
       // #1495 — the two knobs on the inline preview budget. Listed here on purpose: this
       // assertion is the surface gate, so a parameter cannot appear without someone
@@ -194,15 +200,22 @@ describe("image/asset registration", () => {
       "pattern",
       "progressive",
       "quality",
+      // action:"compare" — the BEFORE image, addressed the three ways a source is,
+      // plus the two knobs of the comparison.
+      "reference_asset_id",
+      "reference_filename",
       "reference_path",
+      "reference_subfolder",
+      "reference_type",
       "save_dir",
       "since",
       "subfolder",
+      "tolerance",
       "type",
     ]);
     // prettier-ignore — same reason as GET_IMAGE_ACTIONS in the tool: an action
     // literal is licensed only where it follows `[` or `,` on its own line.
-    expect(json.properties?.action.enum?.slice().sort()).toEqual(["analyze_color", "asset_metadata", "convert", "get", "list_assets", "list_outputs", "view"]);
+    expect(json.properties?.action.enum?.slice().sort()).toEqual(["analyze_color", "asset_metadata", "compare", "convert", "get", "list_assets", "list_outputs", "view"]);
     // Only `action` can be required — the rest are per-action, enforced in the handler.
     expect(json.required).toEqual(["action"]);
   });
@@ -299,6 +312,7 @@ describe("get_image: each action reaches exactly one service", () => {
     listOutputImages: listOutputImagesMock,
     convertImage: convertImageMock,
     analyzeColor: analyzeColorMock,
+    compareImages: compareImagesMock,
   });
 
   /** action → the ONE service it may reach (null = registry-only, no service). */
@@ -308,6 +322,7 @@ describe("get_image: each action reaches exactly one service", () => {
     ["list_outputs", {}, "listOutputImages"],
     ["convert", { asset_id: "a_1", format: "webp" }, "convertImage"],
     ["analyze_color", { filename: "a.png" }, "analyzeColor"],
+    ["compare", { filename: "a.png", reference_path: "b.png" }, "compareImages"],
     ["list_assets", {}, null],
     ["asset_metadata", { asset_id: "a_1" }, null],
   ];
@@ -386,6 +401,37 @@ describe("get_image: each action reaches exactly one service", () => {
       reference_path: "ref.jpg",
       histogram: undefined,
     });
+  });
+
+  it('action:"compare" forwards the edited source and the reference, and passes the map through', async () => {
+    compareImagesMock.mockResolvedValueOnce({
+      content: [
+        { type: "text", text: "Image comparison — MODIFIED (certain)" },
+        { type: "image", data: "AAAA", mimeType: "image/png" },
+      ],
+    });
+    const res = await getImage()({
+      action: "compare",
+      filename: "after.png",
+      reference_filename: "before.png",
+      reference_type: "input",
+      tolerance: 5,
+    });
+    expect(compareImagesMock).toHaveBeenCalledWith({
+      asset_id: undefined,
+      path: undefined,
+      filename: "after.png",
+      subfolder: undefined,
+      type: undefined,
+      reference_path: undefined,
+      reference_asset_id: undefined,
+      reference_filename: "before.png",
+      reference_subfolder: undefined,
+      reference_type: "input",
+      tolerance: 5,
+      locate: undefined,
+    });
+    expect(res.content.map((b: { type: string }) => b.type)).toEqual(["text", "image"]);
   });
 
   it('action:"list_assets" reconciles history first, then reads the registry with limit/since', async () => {

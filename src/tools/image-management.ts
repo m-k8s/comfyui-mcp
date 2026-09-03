@@ -21,6 +21,7 @@ import { viewAssetImage } from "../services/view-image.js";
 import { convertImage } from "../services/image-convert.js";
 import { boundInlineImage } from "../services/inline-preview.js";
 import { analyzeColor } from "../services/color-analysis.js";
+import { compareImages } from "../services/image-compare.js";
 import { uploadOutput } from "../services/storage-upload.js";
 import type { UploadOutputOptions } from "../services/storage-upload.js";
 import { errorToToolResult } from "../utils/errors.js";
@@ -200,7 +201,7 @@ function summarizeRecord(record: ReturnType<typeof AssetRegistry.get>) {
  */
 // prettier-ignore — one line so each member follows `[` or `,`, which is the
 // shape the dead-name gate licenses for a declared action literal.
-const GET_IMAGE_ACTIONS = ["get", "view", "list_outputs", "convert", "analyze_color", "list_assets", "asset_metadata"] as const;
+const GET_IMAGE_ACTIONS = ["get", "view", "list_outputs", "convert", "analyze_color", "compare", "list_assets", "asset_metadata"] as const;
 
 const UPLOAD_IMAGE_ACTIONS = ["image", "video", "audio", "output", "stage"] as const;
 
@@ -214,6 +215,7 @@ export function registerImageManagementTools(server: McpServer): void {
       '- action:"list_outputs" — List recently generated image AND video files from ComfyUI\'s output/ directory, newest-first, with each file\'s kind (\'image\' | \'video\'), subfolder, size, and modification time. Covers stills (.png/.jpg/.jpeg/.bmp) and video/animation outputs (.mp4/.webm/.mov/.mkv/.m4v/.avi/.gif/.webp). LOCAL ComfyUI (COMFYUI_PATH set): a RECURSIVE filesystem scan of output/ (stills + video, including subfolders like video/ that VHS/SaveVideo write to) AND of temp/ for video files — VHS_VideoCombine with `save_output` unchecked writes the completed .mp4 (including the "-audio.mp4" a run completion names) there; those entries are tagged type:"temp" so action:"get" / upload_image (action:"stage") can fetch them. Reports size + modification time. Preview stills in temp/ (PreviewImage) are omitted. REMOTE ComfyUI: derives the list from /history over HTTP instead (size/modified are unavailable and omitted) and includes type:"temp" videos from history the same way. It does NOT return the media bytes themselves — fetch those with action:"get". USE THIS TO CONFIRM A VIDEO RENDER (e.g. VHS_VideoCombine / LTX / WAN output) when get_history (action:"list") shows the prompt done but lists no output: VHS-style video nodes write the file but often do NOT register in ComfyUI\'s /history, so the local filesystem scan is the reliable way to verify the .mp4 exists — then chain it with upload_image (action:"stage"). THAT GUARANTEE IS LOCAL-ONLY AND INVERTS ON A REMOTE TARGET: with no disk to scan, this falls back to /history, so a REMOTE listing can neither confirm nor deny a VHS video that never registered, and absence from it is NOT evidence the file is missing. Check a specific filename with action:"get" or upload_image (action:"stage") instead — both read /view. Every remote result says so in its own text. Read-only.\n' +
       '- action:"convert" — Re-encode a generated image to PNG, JPEG, or WebP and return it inline as an image content block. Source can be a registered asset_id or a path under the local ComfyUI output directory. Optionally writes the converted image back under the output directory and reports source/output size plus bytes saved.\n' +
       '- action:"analyze_color" — Measure the color of a rendered image (not by eye): returns black/white points, contrast (luma std), saturation, per-channel means + cast, and clipping — plus heuristic flags (washedOut, lowContrast, liftedBlacks, dimHighlights, lowSaturation, colorCast) and a one-line verdict. Source = asset_id, a ComfyUI output ref (filename/subfolder/type), or an image path. Pass reference_path to shot-match against a known-good frame (target−reference deltas). Set histogram:true to also get an overlaid R/G/B/luma histogram PNG. Use this to diagnose \'washed out\' objectively and decide a color fix; for a video, extract a frame to PNG first.\n' +
+      '- action:"compare" — Did an edit HAPPEN? Compare the edited image (the usual source) against its BEFORE image (reference_*) pixel by pixel: verdict "unchanged" or "modified" with certainty, share of changed pixels, the changed region, and a change map (red over the dimmed edit). Use it before judging an edit by eye: a workflow that returns its input unchanged (empty mask, strength 0, switch on the wrong side) LOOKS like a success because it is the source image.\n' +
       '- action:"list_assets" — List recently generated assets, newest-first. Each call first reconciles ComfyUI\'s /history, so outputs are listed even when this session did not watch the render complete (e.g. queued via panel_run, by an earlier session, or before a server restart) — those are tagged source:\'history-reconcile\', versus source:\'watched\' for renders this server saw finish. Newly reconciled image refs are checked through /view before registration; stale or unavailable refs are omitted and disclosed in the response note. Returns count + assets (asset_id, prompt_id, filename, url, source, created_at). The registry is ephemeral and clears on server restart; records expire after COMFYUI_ASSET_TTL_HOURS (default 24h), and only the most recent completed runs are reconciled — use get_history (action:\"list\") / action:"get" by filename for anything older.\n' +
       '- action:"asset_metadata" — Get full provenance for a registered asset including the workflow snapshot that produced it. Use this to inspect the parameters that generated an image before calling generate_image (action:"regenerate") with overrides.',
     {
@@ -331,8 +333,29 @@ export function registerImageManagementTools(server: McpServer): void {
         .string()
         .optional()
         .describe(
-          'action:"analyze_color" — optional reference image to shot-match against; returns target−reference deltas for contrast, black/white points, saturation, and per-channel means.',
+          'action:"analyze_color" — optional reference image to shot-match against; returns target−reference deltas for contrast, black/white points, saturation, and per-channel means. action:"compare" — the BEFORE image as an absolute path or a path under the output dir (or use reference_filename / reference_asset_id).',
         ),
+      reference_filename: z
+        .string()
+        .optional()
+        .describe('action:"compare" — the BEFORE image as a ComfyUI filename (with reference_subfolder / reference_type, default output).'),
+      reference_subfolder: z.string().optional().describe('action:"compare" — subfolder of reference_filename.'),
+      reference_type: z
+        .enum(["output", "input", "temp"])
+        .optional()
+        .describe('action:"compare" — directory of reference_filename: output (default), input, or temp. An edit\'s source usually lives in input.'),
+      reference_asset_id: z.string().optional().describe('action:"compare" — the BEFORE image as a registered asset id.'),
+      tolerance: z
+        .number()
+        .int()
+        .min(0)
+        .max(255)
+        .optional()
+        .describe('action:"compare" — per-channel deviation (of 255) under which a pixel counts as unchanged; default 3 absorbs VAE and JPEG round trips.'),
+      locate: z
+        .boolean()
+        .optional()
+        .describe('action:"compare" — draw the change map (default true); false returns the numbers only.'),
       histogram: z
         .boolean()
         .optional()
@@ -777,6 +800,31 @@ export function registerImageManagementTools(server: McpServer): void {
               type: args.type,
               reference_path: args.reference_path,
               histogram: args.histogram,
+            });
+            return {
+              content: result.content.map((block) =>
+                block.type === "image"
+                  ? { type: "image" as const, data: block.data, mimeType: block.mimeType }
+                  : { type: "text" as const, text: block.text },
+              ),
+            };
+          }
+
+          // ── COMPARE (did an edit happen, by the pixels) ────────────────────
+          case "compare": {
+            const result = await compareImages({
+              asset_id: args.asset_id,
+              path: args.path,
+              filename: args.filename,
+              subfolder: args.subfolder,
+              type: args.type,
+              reference_path: args.reference_path,
+              reference_asset_id: args.reference_asset_id,
+              reference_filename: args.reference_filename,
+              reference_subfolder: args.reference_subfolder,
+              reference_type: args.reference_type,
+              tolerance: args.tolerance,
+              locate: args.locate,
             });
             return {
               content: result.content.map((block) =>
