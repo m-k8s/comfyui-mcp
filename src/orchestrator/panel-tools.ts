@@ -768,6 +768,18 @@ function failWithFenceDiagnosis(text: string, diagnosis: FenceRepairDiagnosis): 
 }
 
 /**
+ * Did this refusal install the fence it refused against (`refreshed` above)? The
+ * diagnosis says so in its typed half when it travelled as a ToolResult, and in
+ * its prose when only the text survived (a thrown error re-wrapped by a caller).
+ * A multi-step tool retries such a step once instead of stopping half-way.
+ */
+function fenceRepairedByThisCall(res: ToolResult): boolean {
+  const typed = (res.structuredContent as { panel_fence?: { retry_clears_refusal?: unknown } } | undefined)?.panel_fence;
+  if (typed?.retry_clears_refusal === "yes") return true;
+  return /THIS CALL installed one derived from that canvas/.test(toolResultText(res));
+}
+
+/**
  * #971 — the AMBIGUOUS-rebind refusal, worded so it can be acted on.
  *
  * Refusing here is right (#474: with 2+ live tabs the rebind is ambiguous, so the
@@ -21725,7 +21737,18 @@ export function buildPanelToolDefs(): PanelToolDef[] {
           try {
             res = await ctx.call(cmd);
           } catch (err) {
-            throw new Error(`${label}: ${err instanceof Error ? err.message : String(err)}`);
+            res = fail(err instanceof Error ? err.message : String(err));
+          }
+          // A fresh tab has no identity fence: the first fenced mutation installs
+          // one and reports failure, and the diagnosis says a bare retry clears it.
+          // One retry, only on that word, so a fragment is not left half-applied
+          // by a refusal that was itself the repair.
+          if (res.isError && fenceRepairedByThisCall(res)) {
+            try {
+              res = await ctx.call(cmd);
+            } catch (err) {
+              res = fail(err instanceof Error ? err.message : String(err));
+            }
           }
           const text = toolResultText(res);
           if (res.isError) throw new Error(`${label}: ${text}`);
@@ -26511,12 +26534,17 @@ CHECKED FOR YOU: the graph read this message prescribes was just run, and it ` +
 
         const nodes: Array<{ node_id: number | string; mode: string; previous_mode?: string }> = [];
         for (const nodeId of members) {
-          let res: ToolResult;
-          try {
-            res = await ctx.call({ cmd: "graph_set_node_mode", node_id: nodeId, mode: args.mode, force: args.force });
-          } catch (err) {
-            res = fail(err instanceof Error ? err.message : String(err));
-          }
+          const setMode = async (): Promise<ToolResult> => {
+            try {
+              return await ctx.call({ cmd: "graph_set_node_mode", node_id: nodeId, mode: args.mode, force: args.force });
+            } catch (err) {
+              return fail(err instanceof Error ? err.message : String(err));
+            }
+          };
+          let res = await setMode();
+          // The first fenced mutation on a fresh tab installs the fence and
+          // reports failure; the diagnosis says a bare retry clears it.
+          if (res.isError && fenceRepairedByThisCall(res)) res = await setMode();
           if (res.isError) {
             return fail(
               `Stopped at node ${String(nodeId)}: ${toolResultText(res)}\n` +

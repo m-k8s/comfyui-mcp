@@ -59,17 +59,33 @@ patched_model_71 = CFGNorm(model=model_b, strength=1.0)
 
 type Sent = Array<Record<string, unknown>>;
 
+/** The wording the orchestrator's fence diagnosis uses when the refused call itself installed the fence. */
+const FENCE_JUST_INSTALLED =
+  'cannot be safely targeted to the active workflow: this workflow has no trusted identity to fence the command against.\n\n' +
+  "CHECKED: the live canvas DOES carry an identity (59cb6bb0), this session had NO fence for it, and THIS CALL installed one derived from that canvas — " +
+  "the refusal you are reading is what repaired it, which is why the same call refused now and passes the fence next.";
+
 function harness(
-  opts: { failOn?: (cmd: Record<string, unknown>, nth: number) => boolean; liveNodes?: typeof LIVE_NODES } = {},
+  opts: {
+    failOn?: (cmd: Record<string, unknown>, nth: number) => boolean;
+    liveNodes?: typeof LIVE_NODES;
+    /** Refuse the FIRST mutation the way a fresh tab does, with the fence installed by that refusal. */
+    fenceOnce?: boolean;
+  } = {},
 ) {
   const sent: Sent = [];
   const LIVE = opts.liveNodes ?? LIVE_NODES;
   let nextId = 101;
+  let fenced = !opts.fenceOnce;
   const bridge = {
     send: async (cmd: Record<string, unknown>) => {
       sent.push(cmd);
       const nth = sent.filter((c) => c.cmd === cmd.cmd).length;
       if (opts.failOn?.(cmd, nth)) throw new Error(`simulated failure on ${String(cmd.cmd)}`);
+      if (!fenced && cmd.cmd === "graph_set_widget") {
+        fenced = true;
+        throw new Error(`"panel_set_widget" ${FENCE_JUST_INSTALLED}`);
+      }
       switch (cmd.cmd) {
         case "graph_serialize":
           return { workflow: { nodes: LIVE, links: [] }, node_count: LIVE.length };
@@ -160,6 +176,18 @@ describe("panel_compose_workflow", () => {
     expect(of(sent, "graph_connect")).toEqual([
       expect.objectContaining({ from_node_id: "101", from_output: 0, to_node_id: "102", to_input: "model" }),
     ]);
+  });
+
+  it("retries a step once when the refusal says the fence was installed by that very call", async () => {
+    // A fresh tab has no identity fence; the first fenced mutation installs one
+    // and reports failure. Stopping there would leave a half-applied fragment
+    // for a refusal the panel itself says a bare retry clears.
+    const { sent, ctx } = harness({ fenceOnce: true });
+    const res = await tool().handler({ code: CODE }, ctx);
+    expect(res.isError, textOf(res)).toBeUndefined();
+    const widgets = of(sent, "graph_set_widget");
+    expect(widgets[0]).toEqual(widgets[1]); // the refused step, then its retry
+    expect(of(sent, "graph_connect")).toHaveLength(3);
   });
 
   it("touches nothing on the canvas while a problem stands, and names the line", async () => {
