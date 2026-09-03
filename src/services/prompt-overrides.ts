@@ -35,6 +35,14 @@ export interface PromptListItem {
   /** The stored override text, or null when using the default. */
   override: string | null;
   overridden: boolean;
+  /**
+   * An override exists AND differs from the CURRENT default (whitespace aside).
+   * An override is frozen as saved while the default evolves with releases — a
+   * rule added to the default (the bundled-skills lines of 2c7fb22, for one)
+   * never reaches a stale override, and the editor can only say so if the list
+   * carries the fact.
+   */
+  stale: boolean;
 }
 
 const REGISTRY = new Map<string, PromptDef>();
@@ -164,7 +172,8 @@ export function listPrompts(): PromptListItem[] {
   return [...REGISTRY.values()].map((e) => {
     const o = ov[e.id];
     const overridden = typeof o === "string" && o.trim().length > 0;
-    return { id: e.id, label: e.label, help: e.help, default: e.default, override: overridden ? o : null, overridden };
+    const stale = overridden && o.trim() !== e.default.trim();
+    return { id: e.id, label: e.label, help: e.help, default: e.default, override: overridden ? o : null, overridden, stale };
   });
 }
 

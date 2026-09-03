@@ -439,7 +439,10 @@ harnesses as such. The CONTENT of the skills does travel, though: every
 client can read them through `list_packs` (`action:"skill_list"` to see the
 names, `action:"skill_read"` for a skill's full body), and the built-in prompt of
 the Ollama / custom-endpoint lane tells the model to do so before building a
-graph for a model family. The `list_tools` catalog is designed to carry enough
+graph for a model family. That holds for the DEFAULT prompt: an override saved in
+the panel's prompt editor is frozen as saved and does not pick up rules added
+later, so re-check an old override against the current default after an update.
+The `list_tools` catalog is designed to carry enough
 orientation that agents without that knowledge layer can still find their way.
 
 ## Troubleshooting

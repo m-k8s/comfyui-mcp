@@ -2240,7 +2240,12 @@ export async function runPanelOrchestrator(): Promise<void> {
   // The persona is live-applied here; the other prompts are read fresh at each
   // session/turn, so they take effect on the next spawn without an explicit push.
   registerPrompt("panel.persona", "Panel agent persona (all backends)", PANEL_SYSTEM_APPEND, "Injected into every backend; applies live to running agents.");
-  registerPrompt("backend.ollama", "Ollama / OpenRouter base prompt", OLLAMA_SYSTEM_PROMPT, "Applies on the next local/OpenRouter session.");
+  registerPrompt(
+    "backend.ollama",
+    "Ollama / OpenRouter base prompt",
+    OLLAMA_SYSTEM_PROMPT,
+    "Applies on the next local/OpenRouter session. The default evolves with releases (tool names, the bundled-skills rules); an override freezes the text as saved, so re-check it against the current default after an update.",
+  );
   registerPrompt("proposer.modelCard", "Model Explorer “Ask AI” curator", MODEL_CARD_SYSTEM, "Applies to the next Ask-AI proposal.");
   onPromptsChanged(() => { void refreshEnvCapabilities(); });
 

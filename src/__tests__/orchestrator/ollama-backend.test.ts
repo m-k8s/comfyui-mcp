@@ -5,6 +5,7 @@ import {
   comfyuiSpawnToolMode,
   acceptsModelId,
   blockedRepeatResult,
+  searchLimitResult,
   isOllamaModel,
   ollamaSystemPrompt,
   ollamaZeroToolCause,
@@ -1394,6 +1395,12 @@ describe("the system prompt describes the surface that was actually advertised (
 
   it("the repeat-call and search-limit nudges name the skills next to the packs", () => {
     expect(blockedRepeatResult("list_tools", undefined).text).toContain("skill_list");
+    const limit = searchLimitResult("list_tools", 4);
+    expect(limit.isError).toBe(true);
+    expect(limit.text).toContain("SEARCH LIMIT");
+    expect(limit.text).toContain("list_tools 4 times");
+    expect(limit.text).toContain("skill_list");
+    expect(limit.text).toContain("Do not call list_tools again");
   });
 });
 

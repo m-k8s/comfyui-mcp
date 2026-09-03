@@ -582,6 +582,25 @@ export function blockedRepeatResult(
   };
 }
 
+/**
+ * The catalog was searched `hits` times with no matching tool: the capability
+ * is not here. Stop, and name the most common traps — canvas actions live on
+ * the panel router, Civitai search is a download_model action, model families
+ * are installer packs with a bundled skill. Exported for the same reason as
+ * blockedRepeatResult: the two nudges do the same job and are tested the same way.
+ */
+export function searchLimitResult(discoveryKey: string, hits: number): { text: string; isError: boolean } {
+  return {
+    text:
+      `SEARCH LIMIT: you have called ${discoveryKey} ${hits} times without finding a matching tool — it is very likely NOT in this catalog. STOP searching. ` +
+      `Common misses: GRAPH/CANVAS actions (add a node, connect slots, set a widget, run the workflow) are PANEL tools — panel_call_tool {"name":"panel_add_node"} / panel_connect / panel_set_widget / panel_run, listed by panel_list_tools, NOT here. ` +
+      `Civitai keyword search is download_model action:"search_civitai" (filter by types + base_models, then action:"download_civitai"); ` +
+      `model families like krea2 / qwen-image-edit / wan / ltxv are installer PACKS — call_tool {"name":"list_packs"} — and their bundled SKILLS are list_packs action:"skill_list" / "skill_read". ` +
+      `Otherwise, tell the user plainly what IS available and ask how they want to proceed. Do not call ${discoveryKey} again.`,
+    isError: true,
+  };
+}
+
 function textOf(result: McpCallResult): string {
   return (result.content ?? [])
     .filter((c) => c.type === "text")
@@ -2151,18 +2170,9 @@ export class OllamaBackend implements AgentBackend {
             repeats >= 2
               ? blockedRepeatResult(name, prior?.result)
               : discoveryHits >= 4
-                ? {
-                    // Searched the catalog 4+ times with no hit — the capability
-                    // isn't here. Stop, and name the most common trap (Civitai
-                    // search lives in the OPTIONAL companion server, not here).
-                    text:
-                      `SEARCH LIMIT: you have called ${discoveryKey} ${discoveryHits} times without finding a matching tool — it is very likely NOT in this catalog. STOP searching. ` +
-                      `Common misses: GRAPH/CANVAS actions (add a node, connect slots, set a widget, run the workflow) are PANEL tools — panel_call_tool {"name":"panel_add_node"} / panel_connect / panel_set_widget / panel_run, listed by panel_list_tools, NOT here. ` +
-                      `Civitai keyword search is download_model action:"search_civitai" (filter by types + base_models, then action:"download_civitai"); ` +
-                      `model families like krea2 / qwen-image-edit / wan / ltxv are installer PACKS — call_tool {"name":"list_packs"} — and their bundled SKILLS are list_packs action:"skill_list" / "skill_read". ` +
-                      `Otherwise, tell the user plainly what IS available and ask how they want to proceed. Do not call ${discoveryKey} again.`,
-                    isError: true,
-                  }
+                ? // Searched the catalog 4+ times with no hit — the capability
+                  // isn't here (searchLimitResult names the common traps).
+                  searchLimitResult(discoveryKey ?? name, discoveryHits)
                 : await this.dispatch(name, args);
           // Keep the first payload on the record so a later identical call
           // can replay it (#2430). Count always advances so maxRepeats still
