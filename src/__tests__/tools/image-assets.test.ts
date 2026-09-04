@@ -183,6 +183,8 @@ describe("image/asset registration", () => {
     expect(Object.keys(json.properties ?? {}).sort()).toEqual([
       "action",
       "asset_id",
+      // action:"compare" — restrict the comparison to a ZONE by box "x,y,w,h".
+      "bbox",
       "effort",
       "filename",
       "format",
@@ -190,6 +192,13 @@ describe("image/asset registration", () => {
       "limit",
       "locate",
       "lossless",
+      // action:"compare" — the zone as a mask, addressed the three ways a source is,
+      // plus the mask directory knobs.
+      "mask_asset_id",
+      "mask_filename",
+      "mask_path",
+      "mask_subfolder",
+      "mask_type",
       // #1495 — the two knobs on the inline preview budget. Listed here on purpose: this
       // assertion is the surface gate, so a parameter cannot appear without someone
       // deciding it should.

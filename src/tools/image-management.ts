@@ -356,6 +356,24 @@ export function registerImageManagementTools(server: McpServer): void {
         .boolean()
         .optional()
         .describe('action:"compare" — draw the change map (default true); false returns the numbers only.'),
+      mask_path: z
+        .string()
+        .optional()
+        .describe('action:"compare" — restrict to a ZONE by mask image (luminance >= 128 = zone); reports in-zone vs out-of-zone and flags leaks. Absolute path or path under the output dir (or mask_filename / mask_asset_id). Mutually exclusive with bbox.'),
+      mask_filename: z
+        .string()
+        .optional()
+        .describe('action:"compare" — the zone mask as a ComfyUI filename (with mask_subfolder / mask_type, default input).'),
+      mask_subfolder: z.string().optional().describe('action:"compare" — subfolder of mask_filename.'),
+      mask_type: z
+        .enum(["output", "input", "temp"])
+        .optional()
+        .describe('action:"compare" — directory of mask_filename: input (default), output, or temp.'),
+      mask_asset_id: z.string().optional().describe('action:"compare" — the zone mask as a registered asset id.'),
+      bbox: z
+        .string()
+        .optional()
+        .describe('action:"compare" — restrict to a ZONE by box "x,y,w,h" in image pixels; reports in-zone vs out-of-zone. Mutually exclusive with mask.'),
       histogram: z
         .boolean()
         .optional()
@@ -827,6 +845,12 @@ export function registerImageManagementTools(server: McpServer): void {
               reference_type: args.reference_type,
               tolerance: args.tolerance,
               locate: args.locate,
+              mask_path: args.mask_path,
+              mask_asset_id: args.mask_asset_id,
+              mask_filename: args.mask_filename,
+              mask_subfolder: args.mask_subfolder,
+              mask_type: args.mask_type,
+              bbox: args.bbox,
             });
             return {
               content: result.content.map((block) =>

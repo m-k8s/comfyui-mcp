@@ -33,6 +33,18 @@ const EDIT_THRESHOLD = 0.001; // one pixel in a thousand
 
 const MAP_MAX_WIDTH = 900;
 
+/** Measures over one part of the image: the zone, or everything outside it. */
+export interface ZoneStats {
+  pixels: number;
+  pixels_changed: number;
+  /** Fraction of the part's pixels that changed beyond the tolerance, 0..1. */
+  changed_frac: number;
+  mean_deviation: number;
+  /** 95th percentile of the per-pixel deviation over the part. */
+  p95_deviation: number;
+  max_deviation: number;
+}
+
 export interface CompareStats {
   verdict: "unchanged" | "modified";
   certainty: "certain" | "very likely";
@@ -50,6 +62,12 @@ export interface CompareStats {
   region?: { x: number; y: number; width: number; height: number; share_of_image_pct: number };
   spread?: "concentrated" | "diffuse" | "mixed";
   spread_note?: string;
+  /** Measures inside the zone, when a zone (mask or bbox) is given. */
+  in_zone?: ZoneStats;
+  /** Measures outside the zone, the background noise, when a zone is given. */
+  out_of_zone?: ZoneStats;
+  /** True when a change spilled outside the zone: an inpaint that did not stay put. */
+  leak?: boolean;
 }
 
 export interface CompareRawResult extends CompareStats {
@@ -62,8 +80,58 @@ function round(n: number, digits: number): number {
   return Math.round(n * f) / f;
 }
 
-/** Are these two decoded images different, by how much, and where? */
-export function compareRaw(before: RawPixels, after: RawPixels, tolerance = DEFAULT_TOLERANCE): CompareRawResult {
+/** Per-part accumulators, filled during the single comparison pass. */
+interface ZoneAccumulator {
+  pixels: number;
+  changed: number;
+  sum: number;
+  max: number;
+  /** Histogram of the per-pixel deviation (0..255), for the percentile. */
+  hist: Float64Array;
+}
+
+function newAccumulator(): ZoneAccumulator {
+  return { pixels: 0, changed: 0, sum: 0, max: 0, hist: new Float64Array(256) };
+}
+
+/** The p-th percentile of the deviations counted in a histogram. */
+function histPercentile(hist: Float64Array, total: number, p: number): number {
+  if (total === 0) return 0;
+  const target = p * total;
+  let cum = 0;
+  for (let v = 0; v < 256; v++) {
+    cum += hist[v];
+    if (cum >= target) return v;
+  }
+  return 255;
+}
+
+function zoneStatsOf(acc: ZoneAccumulator): ZoneStats {
+  return {
+    pixels: acc.pixels,
+    pixels_changed: acc.changed,
+    changed_frac: round(acc.pixels ? acc.changed / acc.pixels : 0, 4),
+    mean_deviation: round(acc.pixels ? acc.sum / acc.pixels : 0, 3),
+    p95_deviation: histPercentile(acc.hist, acc.pixels, 0.95),
+    max_deviation: acc.max,
+  };
+}
+
+/**
+ * Are these two decoded images different, by how much, and where?
+ *
+ * When a `zone` is given (1 = inside the zone, one entry per pixel), the same
+ * pass also breaks the measures down into IN the zone and OUT of it, and the
+ * verdict is decided on the zone alone: did the inpaint change what it was
+ * meant to, and did anything leak outside. Without a zone the behaviour is
+ * exactly as before, no breakdown, no leak.
+ */
+export function compareRaw(
+  before: RawPixels,
+  after: RawPixels,
+  tolerance = DEFAULT_TOLERANCE,
+  zone?: Uint8Array,
+): CompareRawResult {
   const size = { before: { width: before.width, height: before.height }, after: { width: after.width, height: after.height } };
   if (before.width !== after.width || before.height !== after.height) {
     // A different size IS a modification, and comparing pixels after a resize
@@ -87,6 +155,8 @@ export function compareRaw(before: RawPixels, after: RawPixels, tolerance = DEFA
   let identical = true;
   let sum = 0;
   let max = 0;
+  const inside = zone ? newAccumulator() : null;
+  const outside = zone ? newAccumulator() : null;
   for (let p = 0; p < total; p++) {
     let worst = 0;
     for (let c = 0; c < channels; c++) {
@@ -96,9 +166,18 @@ export function compareRaw(before: RawPixels, after: RawPixels, tolerance = DEFA
     if (worst > 0) identical = false;
     sum += worst;
     if (worst > max) max = worst;
-    if (worst > tolerance) {
+    const isChanged = worst > tolerance;
+    if (isChanged) {
       mask[p] = 1;
       changed++;
+    }
+    if (zone) {
+      const acc = zone[p] ? inside! : outside!;
+      acc.pixels++;
+      acc.sum += worst;
+      if (worst > acc.max) acc.max = worst;
+      acc.hist[worst]++;
+      if (isChanged) acc.changed++;
     }
   }
   const share = total ? changed / total : 0;
@@ -116,6 +195,8 @@ export function compareRaw(before: RawPixels, after: RawPixels, tolerance = DEFA
     mask,
   };
 
+  if (zone) return zoneVerdict(base, inside!, outside!, before.width, before.height, tolerance);
+
   if (identical) {
     base.reason = "the two images are identical to the pixel. The workflow returned its input as it was.";
     return base;
@@ -130,31 +211,79 @@ export function compareRaw(before: RawPixels, after: RawPixels, tolerance = DEFA
     return base;
   }
 
-  // Where does the change sit?
-  let x0 = before.width;
+  locateChanges(base, mask, before.width, before.height, changed);
+  base.verdict = "modified";
+  base.certainty = "certain";
+  base.reason = `${changed} pixels (${(share * 100).toFixed(2)} %) changed beyond the tolerance of ${tolerance}.`;
+  return base;
+}
+
+/** Where do the changed pixels sit? Fills region, spread, spread_note in place. */
+function locateChanges(stats: CompareStats, mask: Uint8Array, width: number, height: number, changed: number): void {
+  const total = width * height;
+  let x0 = width;
   let x1 = -1;
-  let y0 = before.height;
+  let y0 = height;
   let y1 = -1;
-  for (let y = 0; y < before.height; y++) {
-    for (let x = 0; x < before.width; x++) {
-      if (!mask[y * before.width + x]) continue;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      if (!mask[y * width + x]) continue;
       if (x < x0) x0 = x;
       if (x > x1) x1 = x;
       if (y < y0) y0 = y;
       if (y > y1) y1 = y;
     }
   }
+  if (x1 < 0) return;
   const boxArea = (x1 - x0 + 1) * (y1 - y0 + 1);
   const density = boxArea ? changed / boxArea : 0;
-
-  base.verdict = "modified";
-  base.certainty = "certain";
-  base.reason = `${changed} pixels (${(share * 100).toFixed(2)} %) changed beyond the tolerance of ${tolerance}.`;
-  base.region = { x: x0, y: y0, width: x1 - x0 + 1, height: y1 - y0 + 1, share_of_image_pct: round((boxArea / total) * 100, 2) };
-  base.spread = density > 0.5 ? "concentrated" : density < 0.15 ? "diffuse" : "mixed";
-  if (base.spread === "diffuse") {
-    base.spread_note =
+  stats.region = { x: x0, y: y0, width: x1 - x0 + 1, height: y1 - y0 + 1, share_of_image_pct: round((boxArea / total) * 100, 2) };
+  stats.spread = density > 0.5 ? "concentrated" : density < 0.15 ? "diffuse" : "mixed";
+  if (stats.spread === "diffuse") {
+    stats.spread_note =
       "The changed pixels are scattered across the region: the mark of a global re-encode rather than a local retouch.";
+  }
+}
+
+/**
+ * The verdict when a zone is in play. The zone decides "modified": did the
+ * inpaint change what it was meant to. Everything outside is background noise,
+ * and a change there is a leak, reported apart from the verdict.
+ */
+function zoneVerdict(
+  base: CompareRawResult,
+  inside: ZoneAccumulator,
+  outside: ZoneAccumulator,
+  width: number,
+  height: number,
+  tolerance: number,
+): CompareRawResult {
+  base.in_zone = zoneStatsOf(inside);
+  base.out_of_zone = zoneStatsOf(outside);
+  const inShare = inside.pixels ? inside.changed / inside.pixels : 0;
+  const outShare = outside.pixels ? outside.changed / outside.pixels : 0;
+  base.leak = outShare >= EDIT_THRESHOLD;
+  locateChanges(base, base.mask, width, height, base.pixels_changed ?? 0);
+
+  const leakNote = base.leak
+    ? ` A leak: ${outside.changed} pixel(s) outside the zone changed too.`
+    : "";
+  if (inShare >= EDIT_THRESHOLD) {
+    base.verdict = "modified";
+    base.certainty = "certain";
+    base.reason =
+      `${inside.changed} of ${inside.pixels} zone pixels (${round(inShare * 100, 2)} %) ` +
+      `changed beyond the tolerance of ${tolerance}.${leakNote}`;
+  } else {
+    base.verdict = "unchanged";
+    base.certainty = "certain";
+    base.reason =
+      `the zone is unchanged: ${inside.changed} of ${inside.pixels} zone pixels ` +
+      `exceed the tolerance of ${tolerance}.${leakNote}`;
+    if (base.leak) {
+      base.caution =
+        "Nothing changed inside the zone, yet pixels changed outside it: the edit missed its target or spilled.";
+    }
   }
   return base;
 }
@@ -165,7 +294,11 @@ export function compareRaw(before: RawPixels, after: RawPixels, tolerance = DEFA
  * underneath is what lets a reader say "the change is on the head" rather than
  * "there is white at the top left".
  */
-export async function renderChangeMap(after: RawPixels, mask: Uint8Array): Promise<{ data: string; mimeType: string }> {
+export async function renderChangeMap(
+  after: RawPixels,
+  mask: Uint8Array,
+  zone?: Uint8Array,
+): Promise<{ data: string; mimeType: string }> {
   const sharp = await requireSharp("Image comparison");
   const total = after.width * after.height;
   const c = after.channels;
@@ -174,7 +307,10 @@ export async function renderChangeMap(after: RawPixels, mask: Uint8Array): Promi
     const r = after.data[p * c];
     const g = c > 1 ? after.data[p * c + 1] : r;
     const b = c > 2 ? after.data[p * c + 2] : r;
-    const luma = Math.min(255, Math.round((0.299 * r + 0.587 * g + 0.114 * b) * 0.45 + 90));
+    let luma = Math.min(255, Math.round((0.299 * r + 0.587 * g + 0.114 * b) * 0.45 + 90));
+    // Outside the zone, dim the background so the zone reads at a glance. The
+    // changed pixels stay red everywhere, so a leak outside the zone is visible.
+    if (zone && !zone[p]) luma = Math.round(luma * 0.45);
     if (mask[p]) {
       rgb[p * 3] = 255;
       rgb[p * 3 + 1] = Math.round(luma * 0.25);
@@ -201,6 +337,14 @@ export interface CompareImagesOptions extends AnalyzeColorOptions {
   tolerance?: number;
   /** Draw the change map (default true). */
   locate?: boolean;
+  /** Restrict the comparison to a ZONE, by mask: luminance >= 128 marks it. */
+  mask_path?: string;
+  mask_asset_id?: string;
+  mask_filename?: string;
+  mask_subfolder?: string;
+  mask_type?: "output" | "input" | "temp";
+  /** Restrict the comparison to a ZONE, by box: "x,y,w,h" in image pixels. */
+  bbox?: string;
 }
 
 export interface CompareImagesResult {
@@ -229,12 +373,80 @@ async function referenceBytes(opts: CompareImagesOptions): Promise<Buffer> {
   );
 }
 
+async function maskBytes(opts: CompareImagesOptions): Promise<Buffer> {
+  if (opts.mask_asset_id || opts.mask_filename) {
+    return resolveBytes(
+      {
+        asset_id: opts.mask_asset_id,
+        filename: opts.mask_filename,
+        subfolder: opts.mask_subfolder,
+        type: opts.mask_type ?? "input",
+      },
+      'get_image (action:"compare") mask',
+    );
+  }
+  const p = (opts.mask_path ?? "").trim();
+  if (!p) throw new ValidationError("mask_path must be a non-empty string.");
+  return isAbsolute(p) ? readFile(resolve(p)) : resolveBytes({ path: p }, 'get_image (action:"compare") mask');
+}
+
+/** Does the caller ask for a mask zone? */
+function hasMask(opts: CompareImagesOptions): boolean {
+  return Boolean(opts.mask_path || opts.mask_asset_id || opts.mask_filename);
+}
+
+/** A zone from a mask image: luminance >= 128 marks the zone, resized to fit. */
+async function maskToZone(opts: CompareImagesOptions, width: number, height: number): Promise<Uint8Array> {
+  const sharp = await requireSharp("Image comparison");
+  const bytes = await maskBytes(opts);
+  const { data, info } = await sharp(bytes, { limitInputPixels: 100_000_000 })
+    .resize(width, height, { kernel: "lanczos3", fit: "fill" })
+    .greyscale()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+  const stride = info.channels;
+  const zone = new Uint8Array(width * height);
+  for (let p = 0; p < zone.length; p++) zone[p] = data[p * stride] >= 128 ? 1 : 0;
+  return zone;
+}
+
+/** A zone from a "x,y,w,h" box in image coordinates, clamped to the image. */
+function bboxToZone(bbox: string, width: number, height: number): Uint8Array {
+  const parts = bbox.split(",").map((s) => s.trim());
+  const nums = parts.map((s) => Number(s));
+  if (parts.length !== 4 || nums.some((n) => !Number.isInteger(n))) {
+    throw new ValidationError('bbox must be four integers "x,y,w,h" in image pixels.');
+  }
+  const [x, y, w, h] = nums;
+  const x0 = Math.max(0, x);
+  const y0 = Math.max(0, y);
+  const x1 = Math.min(width, x + w);
+  const y1 = Math.min(height, y + h);
+  const zone = new Uint8Array(width * height);
+  for (let yy = y0; yy < y1; yy++) for (let xx = x0; xx < x1; xx++) zone[yy * width + xx] = 1;
+  return zone;
+}
+
 /** Compare the edited image (the usual source triple) against its reference (the before). */
 export async function compareImages(opts: CompareImagesOptions): Promise<CompareImagesResult> {
   const feature = 'get_image (action:"compare")';
+  if (hasMask(opts) && opts.bbox) {
+    throw new ValidationError('get_image (action:"compare"): mask and bbox are mutually exclusive, pass only one.');
+  }
   const [beforeBytes, afterBytes] = await Promise.all([referenceBytes(opts), resolveBytes(opts, feature)]);
   const [before, after] = await Promise.all([toRaw(beforeBytes, "Image comparison"), toRaw(afterBytes, "Image comparison")]);
-  const { mask, ...stats } = compareRaw(before, after, opts.tolerance ?? DEFAULT_TOLERANCE);
+
+  let zone: Uint8Array | undefined;
+  if (hasMask(opts)) {
+    zone = await maskToZone(opts, after.width, after.height);
+  } else if (opts.bbox) {
+    zone = bboxToZone(opts.bbox, after.width, after.height);
+  }
+  if (zone && !zone.some((v) => v === 1)) {
+    throw new ValidationError('get_image (action:"compare"): the zone is empty (mask all black, or bbox outside the image).');
+  }
+
+  const { mask, ...stats } = compareRaw(before, after, opts.tolerance ?? DEFAULT_TOLERANCE, zone);
 
   const content: CompareImagesResult["content"] = [
     {
@@ -244,11 +456,13 @@ export async function compareImages(opts: CompareImagesOptions): Promise<Compare
         JSON.stringify(stats, null, 2),
     },
   ];
-  if (stats.verdict === "modified" && stats.region && opts.locate !== false) {
-    const map = await renderChangeMap(after, mask);
+  if (stats.region && opts.locate !== false) {
+    const map = await renderChangeMap(after, mask, zone);
     content.push({
       type: "text",
-      text: "Change map: in red, the pixels that changed; in dimmed grey, the edited image, to place the region.",
+      text: zone
+        ? "Change map: in red, the changed pixels; the zone is bright, the rest dimmed to place it."
+        : "Change map: in red, the pixels that changed; in dimmed grey, the edited image, to place the region.",
     });
     content.push({ type: "image", data: map.data, mimeType: map.mimeType });
   }
