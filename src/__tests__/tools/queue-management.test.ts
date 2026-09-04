@@ -14,6 +14,7 @@ import { DEAD_NAMES, TOOL_NAMES } from "../../tools/vocabulary.js";
 const mocks = vi.hoisted(() => ({
   getQueueSummary: vi.fn(),
   getJobStatus: vi.fn(),
+  waitForJob: vi.fn(),
   getQueuedWorkflow: vi.fn(),
   moveQueuedJob: vi.fn(),
   editQueuedJob: vi.fn(),
@@ -23,8 +24,10 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../services/queue-manager.js", () => ({
+  JOB_WAIT_HARD_CAP_S: 600,
   getQueueSummary: (...args: unknown[]) => mocks.getQueueSummary(...args),
   getJobStatus: (...args: unknown[]) => mocks.getJobStatus(...args),
+  waitForJob: (...args: unknown[]) => mocks.waitForJob(...args),
   getQueuedWorkflow: (...args: unknown[]) => mocks.getQueuedWorkflow(...args),
   moveQueuedJob: (...args: unknown[]) => mocks.moveQueuedJob(...args),
   editQueuedJob: (...args: unknown[]) => mocks.editQueuedJob(...args),
@@ -96,6 +99,7 @@ describe("queue registration", () => {
       "node_inputs",
       "position",
       "prompt_id",
+      "timeout_s",
       "workflow",
     ]);
     expect(json.properties?.action.enum?.sort()).toEqual([
@@ -107,6 +111,7 @@ describe("queue registration", () => {
       "list",
       "move",
       "status",
+      "wait",
     ]);
     // Only `action` can be required — the rest are per-action, enforced in the handler.
     expect(json.required).toEqual(["action"]);
@@ -137,6 +142,70 @@ describe("queue actions call the same services with the same arguments", () => {
     const res = await handler()({ action: "status", prompt_id: "p1" });
     expect(mocks.getJobStatus).toHaveBeenCalledWith("p1");
     expect(JSON.parse(text(res))).toEqual({ running: true, pending: false, done: false });
+  });
+
+  it('action:"wait" forwards prompt_id + timeout_s and returns the wait result JSON', async () => {
+    mocks.waitForJob.mockResolvedValueOnce({
+      prompt_id: "p1",
+      found: true,
+      done: true,
+      state: "success",
+      timed_out: false,
+      waited_s: 3,
+      outputs: [{ node_id: "9", files: [{ filename: "o.png", subfolder: "", type: "output" }] }],
+    });
+    const res = await handler()({ action: "wait", prompt_id: "p1", timeout_s: 42 });
+    expect(mocks.waitForJob).toHaveBeenCalledWith("p1", 42);
+    expect(res.isError).toBeUndefined();
+    expect(JSON.parse(text(res))).toMatchObject({ state: "success", done: true });
+  });
+
+  // NEVER silent on a failure: a run that ends in error/cancelled/interrupted,
+  // or a prompt_id ComfyUI has no record of, must surface as isError so an
+  // external MCP client cannot read a failed render as a success.
+  it('action:"wait" surfaces isError when the run failed', async () => {
+    mocks.waitForJob.mockResolvedValueOnce({
+      prompt_id: "p1",
+      found: true,
+      done: true,
+      state: "error",
+      timed_out: false,
+      waited_s: 2,
+      error: { node_id: "3", node_type: "KSampler", exception_message: "boom" },
+    });
+    const res = await handler()({ action: "wait", prompt_id: "p1" });
+    expect(mocks.waitForJob).toHaveBeenCalledWith("p1", undefined);
+    expect(res.isError).toBe(true);
+    expect(text(res)).toMatch(/boom/);
+  });
+
+  it('action:"wait" surfaces isError for a prompt_id ComfyUI never executed', async () => {
+    mocks.waitForJob.mockResolvedValueOnce({
+      prompt_id: "p1",
+      found: false,
+      done: false,
+      state: "unknown",
+      timed_out: false,
+      waited_s: 0,
+      message: "ComfyUI has no record of this prompt.",
+    });
+    const res = await handler()({ action: "wait", prompt_id: "p1" });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toMatch(/no record of this prompt/i);
+  });
+
+  it('action:"wait" that timed out is NOT an error (still running, just incomplete)', async () => {
+    mocks.waitForJob.mockResolvedValueOnce({
+      prompt_id: "p1",
+      found: true,
+      done: false,
+      state: "unknown",
+      timed_out: true,
+      waited_s: 300,
+    });
+    const res = await handler()({ action: "wait", prompt_id: "p1" });
+    expect(res.isError).toBeUndefined();
+    expect(JSON.parse(text(res))).toMatchObject({ timed_out: true });
   });
 
   it('action:"get_workflow" returns the pending item JSON', async () => {
@@ -331,7 +400,7 @@ describe("queue actions call the same services with the same arguments", () => {
 
 describe("per-action presence guards (the flat shape cannot schema-require these)", () => {
   it("prompt_id-less status/get_workflow/move/edit/cancel_queued name the missing field and call nothing", async () => {
-    for (const action of ["status", "get_workflow", "move", "edit", "cancel_queued"]) {
+    for (const action of ["status", "wait", "get_workflow", "move", "edit", "cancel_queued"]) {
       const res = await handler()({ action });
       expect(res.isError).toBe(true);
       expect(text(res)).toContain(`action:"${action}" requires \`prompt_id\``);

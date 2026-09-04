@@ -1,6 +1,7 @@
 import {
   getClient,
   getHistory,
+  type HistoryEntry,
   getQueue as clientGetQueue,
   getQueueVerified as clientGetQueueVerified,
   interrupt as clientInterrupt,
@@ -17,10 +18,12 @@ import { logger } from "../utils/logger.js";
 import { ComfyUIError, ValidationError } from "../utils/errors.js";
 import {
   analyzeHistoryEntry,
+  historyTerminalMessage,
   type ExecutionErrorDetails,
   type ExecutionStats,
   type TextOutput,
 } from "./job-history.js";
+import { normalizeAssetType } from "./asset-registry.js";
 import { JobWatcher } from "./job-watcher.js";
 
 export interface QueueSummary {
@@ -351,6 +354,281 @@ export async function getJobStatus(
     }
     return status;
   }
+}
+
+// ── wait ─────────────────────────────────────────────────────────────────────
+
+/** One media file a finished run wrote, in the shape get_image (action:"get")
+ *  consumes directly. */
+export interface JobOutputFile {
+  filename: string;
+  subfolder: string;
+  type: string;
+}
+
+/** The media a single node produced. */
+export interface JobOutputNode {
+  node_id: string;
+  files: JobOutputFile[];
+}
+
+/** The explicit terminal verdict of a run. "unknown" is reserved for a state
+ *  the wait could NOT establish (timed out mid-run, or /history unreadable):
+ *  it is never used to paper over a failure. */
+export type JobTerminalState =
+  | "success"
+  | "error"
+  | "cancelled"
+  | "interrupted"
+  | "unknown";
+
+export interface JobWaitResult {
+  prompt_id: string;
+  /** false only when ComfyUI has no record of the prompt (never ran / lost to a
+   *  restart). Distinct from a run that finished: absence is not completion. */
+  found: boolean;
+  done: boolean;
+  state: JobTerminalState;
+  timed_out: boolean;
+  waited_s: number;
+  status_str?: string;
+  error?: ExecutionErrorDetails;
+  execution_stats?: ExecutionStats;
+  text_outputs?: TextOutput[];
+  /** Media outputs per node, present only when the run wrote files. */
+  outputs?: JobOutputNode[];
+  message?: string;
+}
+
+/** Absolute hard cap, matching batch action:"wait" (batch-manager
+ *  WAIT_HARD_CAP_S), so queue action:"wait" can never hang an agent turn. */
+export const JOB_WAIT_HARD_CAP_S = 600;
+const JOB_WAIT_DEFAULT_S = 300;
+const JOB_WAIT_POLL_INTERVAL_MS = 1000;
+
+/** Injection seams for tests: the loop's status source and the terminal
+ *  history read both default to the real services every other client uses. */
+interface WaitForJobDeps {
+  pollIntervalMs?: number;
+  statusFn?: (promptId: string) => Promise<JobStatus>;
+  historyFn?: (promptId: string) => Promise<Record<string, HistoryEntry>>;
+}
+
+/** Flatten a finished run's /history outputs into {filename, subfolder, type}
+ *  per node (the same media source get_history reports), filtered to real refs
+ *  (a non-empty string filename) so a malformed entry never yields a file with
+ *  filename=undefined. */
+function collectMediaOutputs(entry: HistoryEntry): JobOutputNode[] {
+  const result: JobOutputNode[] = [];
+  const outputs = (entry as { outputs?: Record<string, unknown> }).outputs;
+  if (!outputs || typeof outputs !== "object") return result;
+
+  for (const [nodeId, nodeOutput] of Object.entries(outputs)) {
+    if (!nodeOutput || typeof nodeOutput !== "object") continue;
+    const record = nodeOutput as Record<string, unknown>;
+    const files: JobOutputFile[] = [];
+    for (const key of ["images", "videos", "video", "gifs"] as const) {
+      const arr = record[key];
+      if (!Array.isArray(arr)) continue;
+      for (const item of arr) {
+        if (!item || typeof item !== "object") continue;
+        const ref = item as { filename?: unknown; subfolder?: unknown; type?: unknown };
+        if (typeof ref.filename !== "string" || ref.filename.length === 0) continue;
+        files.push({
+          filename: ref.filename,
+          subfolder: typeof ref.subfolder === "string" ? ref.subfolder : "",
+          type: normalizeAssetType(ref.type),
+        });
+      }
+    }
+    if (files.length > 0) result.push({ node_id: nodeId, files });
+  }
+  return result;
+}
+
+/** Derive the explicit terminal verdict. The /history terminal message is the
+ *  authority (error beats interrupt beats success); the entry's status_str and
+ *  the polled status are fallbacks when no message is present (e.g. cloud). */
+function deriveTerminalState(status: JobStatus, entry?: HistoryEntry): JobTerminalState {
+  if (entry) {
+    const terminal = historyTerminalMessage(entry);
+    if (terminal?.[0] === "execution_error") return "error";
+    if (terminal?.[0] === "execution_interrupted") return "interrupted";
+    if (terminal?.[0] === "execution_success") return "success";
+    const entryStatus = entry.status?.status_str;
+    if (entryStatus === "success") return "success";
+    if (entryStatus === "error") return "error";
+    if (entryStatus === "cancelled") return "cancelled";
+    if (entryStatus === "interrupted") return "interrupted";
+  }
+  if (status.error) return "error";
+  switch (status.status_str) {
+    case "success":
+      return "success";
+    case "error":
+      return "error";
+    case "cancelled":
+      return "cancelled";
+    case "interrupted":
+      return "interrupted";
+    default:
+      return "unknown";
+  }
+}
+
+/** Build the terminal result once the loop has settled on a done or
+ *  never-ran status. Reads /history once for outputs and the precise verdict. */
+async function buildTerminalResult(
+  promptId: string,
+  status: JobStatus,
+  waitedS: number,
+  historyFn: (promptId: string) => Promise<Record<string, HistoryEntry>>,
+): Promise<JobWaitResult> {
+  // Never ran / lost to a restart: absence is not a completion, so do not
+  // pretend a state. Mirror queue action:"status"'s found:false reply.
+  if (status.found === false) {
+    return {
+      prompt_id: promptId,
+      found: false,
+      done: false,
+      state: "unknown",
+      timed_out: false,
+      waited_s: waitedS,
+      message:
+        status.message ??
+        `ComfyUI has no record of prompt ${promptId}: not running, not queued, and absent ` +
+          `from /history. It never ran or was lost to a restart; do not wait for outputs.`,
+    };
+  }
+
+  let entry: HistoryEntry | undefined;
+  let outputs: JobOutputNode[] | undefined;
+  try {
+    const history = await historyFn(promptId);
+    entry = history[promptId];
+    if (entry) {
+      const media = collectMediaOutputs(entry);
+      if (media.length > 0) outputs = media;
+    }
+  } catch (err) {
+    // A terminal status stands even when the history read for outputs fails;
+    // the verdict then falls back to the polled status fields.
+    logger.debug("waitForJob: could not read /history for outputs", {
+      prompt_id: promptId,
+      error: err instanceof Error ? err.message : err,
+    });
+  }
+
+  return {
+    prompt_id: promptId,
+    found: true,
+    done: true,
+    state: deriveTerminalState(status, entry),
+    timed_out: false,
+    waited_s: waitedS,
+    ...(status.status_str ? { status_str: status.status_str } : {}),
+    ...(status.error ? { error: status.error } : {}),
+    ...(status.execution_stats ? { execution_stats: status.execution_stats } : {}),
+    ...(status.text_outputs ? { text_outputs: status.text_outputs } : {}),
+    ...(outputs ? { outputs } : {}),
+  };
+}
+
+/**
+ * Block until ONE prompt_id reaches a terminal state (done, or a proven
+ * "never ran"), then report the explicit verdict and the run's outputs.
+ *
+ * This is the async completion an external MCP client cannot otherwise get:
+ * the panel's run-completion gateway replays a finish only into the PANEL
+ * agent's turn, and MCP is request/response with no server push, so every
+ * other client needs a blocking wait it can call itself. It loops on the SAME
+ * getJobStatus queue action:"status" uses (never a separate HTTP poll) at a
+ * modest interval, and races an absolute deadline so a stalled ComfyUI can
+ * never hang the turn past the (capped) timeout, exactly like waitForBatch.
+ */
+export async function waitForJob(
+  promptId: string,
+  timeoutS?: number,
+  deps: WaitForJobDeps = {},
+): Promise<JobWaitResult> {
+  const statusFn = deps.statusFn ?? getJobStatus;
+  const historyFn = deps.historyFn ?? getHistory;
+  const pollIntervalMs = deps.pollIntervalMs ?? JOB_WAIT_POLL_INTERVAL_MS;
+
+  const requested = Number.isFinite(timeoutS) && timeoutS! > 0 ? timeoutS! : JOB_WAIT_DEFAULT_S;
+  const capped = Math.min(requested, JOB_WAIT_HARD_CAP_S);
+  const started = Date.now();
+  const deadline = started + capped * 1000;
+  const elapsedS = (): number => Math.round((Date.now() - started) / 1000);
+
+  // The hard cap must hold even when a single status fetch stalls on a wedged
+  // ComfyUI (the underlying fetch has no abort timeout). So the whole poll loop
+  // races an absolute deadline timer; a stalled in-flight await is abandoned.
+  let lastStatus: JobStatus | null = null;
+
+  const pollLoop = (async (): Promise<JobStatus> => {
+    let status = await statusFn(promptId);
+    lastStatus = status;
+    // found:false is terminal in the "never ran" sense: stop at once, never
+    // wait a prompt that was never a completion out to the deadline.
+    while (!status.done && status.found !== false && Date.now() < deadline) {
+      await sleep(Math.min(pollIntervalMs, Math.max(50, deadline - Date.now())));
+      status = await statusFn(promptId);
+      lastStatus = status;
+    }
+    return status;
+  })();
+
+  let deadlineTimer: NodeJS.Timeout | undefined;
+  const deadlineHit = new Promise<"deadline">((resolve) => {
+    deadlineTimer = setTimeout(() => resolve("deadline"), Math.max(0, deadline - Date.now()));
+    deadlineTimer.unref?.();
+  });
+
+  try {
+    const winner = await Promise.race([pollLoop, deadlineHit]);
+    if (winner !== "deadline") {
+      if (winner.done || winner.found === false) {
+        return await buildTerminalResult(promptId, winner, elapsedS(), historyFn);
+      }
+      // The loop exited on the deadline check with a non-terminal status.
+      return timedOutResult(promptId, winner, elapsedS());
+    }
+  } finally {
+    clearTimeout(deadlineTimer);
+    void pollLoop.catch(() => undefined);
+  }
+
+  // Deadline fired while a poll was still in flight. Honor a terminal snapshot
+  // if we happened to capture one; otherwise report the timeout honestly.
+  // TS can't see the closure assignment above, so re-widen explicitly (same
+  // idiom waitForBatch uses for its `record`).
+  const snapshot = lastStatus as JobStatus | null;
+  if (snapshot && (snapshot.done || snapshot.found === false)) {
+    return await buildTerminalResult(promptId, snapshot, elapsedS(), historyFn);
+  }
+  return timedOutResult(promptId, snapshot, elapsedS());
+}
+
+/** A run that had not finished when the wait's deadline arrived. Never claims a
+ *  terminal verdict: it is incomplete, not failed. */
+function timedOutResult(
+  promptId: string,
+  status: JobStatus | null,
+  waitedS: number,
+): JobWaitResult {
+  return {
+    prompt_id: promptId,
+    found: true,
+    done: false,
+    state: "unknown",
+    timed_out: true,
+    waited_s: waitedS,
+    ...(status?.status_str ? { status_str: status.status_str } : {}),
+    message:
+      `Timed out after ${waitedS}s: prompt ${promptId} is still in progress (not failed). ` +
+      `Call queue (action:"wait") again to keep waiting, or queue (action:"status") to check.`,
+  };
 }
 
 export async function cancelRunningJob(promptId?: string): Promise<void> {

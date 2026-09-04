@@ -3,6 +3,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   getQueueSummary,
   getJobStatus,
+  waitForJob,
+  JOB_WAIT_HARD_CAP_S,
   getQueuedWorkflow,
   moveQueuedJob,
   editQueuedJob,
@@ -38,6 +40,7 @@ export function registerQueueManagementTools(server: McpServer): void {
     "Inspect and manage the ComfyUI execution queue. Driven by the `action` parameter:\n" +
       '- action:"list" — The job running now plus all pending jobs, each with its prompt_id and position. Read-only; requires a reachable ComfyUI server (works against local or remote --comfyui-url). Omits queued workflow payloads by default to keep output small; set include_workflows:true when you need to inspect or edit the exact pending payload. Use this before action:"cancel" (running), action:"cancel_queued"/action:"clear" (pending), action:"move", or action:"edit".\n' +
       '- action:"status" — Check ONE job by its prompt_id (the id returned by enqueue_workflow). Queries the connected ComfyUI server; requires it to be running. Returns JSON with running, pending, and done booleans, plus optional status_str, error details, and execution_stats from ComfyUI history once the job is done. If the prompt is neither running nor queued AND /history has no record of it (a restart wipes both), it returns done:false + found:false with an explanatory message — a prompt ComfyUI never executed is NOT a completion, so do not wait for its outputs. Also returns text_outputs when the workflow contained text-preview nodes (Preview as Text, ShowText, …) — those produce no image file, so this is the ONLY way to read their result; report that text back to the user. Use action:"list" to see the whole queue at once, and get_history for full output filenames.\n' +
+      `- action:"wait": BLOCK until ONE job (by prompt_id) reaches a TERMINAL state, then return its explicit verdict and outputs. This is how a NON-panel MCP client (e.g. Claude Code) gets a run's result: the panel's auto-notification only reaches the panel's OWN agent, and MCP has no server push, so poll-free waiting needs this call. Loops on the same status source as action:"status" (default timeout 300s, hard cap ${JOB_WAIT_HARD_CAP_S}s, so it can never hang). Returns JSON: state ("success"/"error"/"cancelled"/"interrupted"), found, done, timed_out, waited_s, execution_stats when available, error details on a failed run (NEVER silent about failure), and outputs (a {filename, subfolder, type} list per node, ready to feed straight to get_image action:"get"). If the prompt is neither running, queued, nor in /history (a restart wipes both) it returns found:false at once instead of waiting: a prompt ComfyUI never executed is NOT a completion. If timed_out is true the run is still in progress (not failed); call again or check action:"status". For MANY jobs at once use batch action:"wait".\n` +
       '- action:"get_workflow" — The full workflow payload for one PENDING queue item by prompt_id. Read-only. Does not work for the currently running job because ComfyUI cannot safely edit a job after execution starts.\n' +
       '- action:"move" — Move a PENDING queue item to the front or back by removing it and re-enqueuing its saved workflow payload; `position` ("front"|"back") is required. The job receives a NEW prompt_id; the old prompt_id is removed. Running jobs cannot be moved.\n' +
       '- action:"edit" — Edit a PENDING queue item by removing it and re-enqueuing an updated workflow. Provide either a complete replacement `workflow` or `node_inputs` patches keyed by node id; `position` selects where to requeue (default back). The job receives a NEW prompt_id; the old prompt_id is removed. Running jobs cannot be edited.\n' +
@@ -46,9 +49,9 @@ export function registerQueueManagementTools(server: McpServer): void {
       '- action:"clear" — Clear ALL pending jobs from the queue. Does not affect the currently running job.',
     {
       action: z
-        .enum(["list", "status", "get_workflow", "move", "edit", "cancel", "cancel_queued", "clear"])
+        .enum(["list", "status", "wait", "get_workflow", "move", "edit", "cancel", "cancel_queued", "clear"])
         .describe(
-          'Which queue operation to perform. "list" and "clear" take no other parameters; "status", "get_workflow" and "cancel_queued" require `prompt_id`; "move" requires `prompt_id` + `position`; "edit" requires `prompt_id` (optional `workflow`/`node_inputs`/`position`); "cancel" takes an optional `prompt_id` and `clear_pending`.',
+          'Which queue operation to perform. "list" and "clear" take no other parameters; "status", "wait", "get_workflow" and "cancel_queued" require `prompt_id` ("wait" also takes `timeout_s`); "move" requires `prompt_id` + `position`; "edit" requires `prompt_id` (optional `workflow`/`node_inputs`/`position`); "cancel" takes an optional `prompt_id` and `clear_pending`.',
         ),
       prompt_id: z
         .string()
@@ -86,6 +89,10 @@ export function registerQueueManagementTools(server: McpServer): void {
         .describe(
           'action:"cancel" — also clear ALL pending jobs (recommended when resetting after a stuck/slow render, so a re-queue doesn\'t stack behind a backlog). Default false.',
         ),
+      timeout_s: z
+        .number()
+        .optional()
+        .describe(`action:"wait": max seconds to block (default 300, hard cap ${JOB_WAIT_HARD_CAP_S}).`),
     },
     async (args) => {
       try {
@@ -113,6 +120,26 @@ export function registerQueueManagementTools(server: McpServer): void {
             return json(await getQueueSummary({ include_workflows: args.include_workflows }));
           case "status":
             return json(await getJobStatus(requirePromptId("status", "the job to check")));
+          case "wait": {
+            const result = await waitForJob(
+              requirePromptId("wait", "the job to wait for"),
+              args.timeout_s,
+            );
+            // NEVER silent on a failure. A run that ended in error/cancelled/
+            // interrupted, or a prompt_id ComfyUI has no record of, is marked
+            // isError so a client cannot read a failed render as a success. A
+            // success stays clean; a timeout is NOT an error (the run is still
+            // in progress, not failed): the JSON's timed_out says so.
+            const failed =
+              !result.found ||
+              result.state === "error" ||
+              result.state === "cancelled" ||
+              result.state === "interrupted";
+            return {
+              content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }],
+              ...(failed ? { isError: true } : {}),
+            };
+          }
           case "get_workflow":
             return json(
               await getQueuedWorkflow(
@@ -222,7 +249,7 @@ export function registerQueueManagementTools(server: McpServer): void {
             // silent undefined if the schema and switch ever drift apart.
             const exhaustive: never = args.action;
             throw new Error(
-              `Unknown queue action "${String(exhaustive)}". Expected one of: list, status, get_workflow, move, edit, cancel, cancel_queued, clear.`,
+              `Unknown queue action "${String(exhaustive)}". Expected one of: list, status, wait, get_workflow, move, edit, cancel, cancel_queued, clear.`,
             );
           }
         }
